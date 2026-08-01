@@ -52,7 +52,11 @@ export const MAX_QUERY_CHARS = 1_000;
 export const MAX_TOP_K = 20;
 export const MAX_PAGES_PER_CALL = 200;
 export const MAX_DOCUMENTS = 100;
-export const MAX_DOCUMENT_BYTES = 100_000;
+// 100 KiB, matching the worker's MAX_DOCUMENT_TEXT_BYTES exactly — NOT 100_000.
+// Measured the same way the worker measures it: TextEncoder().encode(text).length.
+// A stricter client value fails safe but spuriously rejects documents the service
+// would have accepted, so the two must agree to the byte.
+export const MAX_DOCUMENT_BYTES = 100 * 1024;
 
 const DEFAULT_NETWORK = "eip155:8453";
 

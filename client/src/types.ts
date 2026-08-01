@@ -95,6 +95,12 @@ export interface AskPending {
   pages_total: number;
   /** Seconds to wait before polling again. */
   retry_after: number;
+  /**
+   * Present only on `ingest`'s 202, which settles its charge before returning.
+   * `ask`'s 202 computes usage later in the request and therefore sends none.
+   */
+  usage?: UsageBlock;
+  request_id?: string;
 }
 
 export interface IngestDocument {
@@ -145,4 +151,5 @@ export interface CollectionStatus {
     pages_total: number;
     state: "running" | "complete" | "failed";
   };
+  request_id?: string;
 }

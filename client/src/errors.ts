@@ -61,6 +61,9 @@ export type RagErrorCode =
   | "asset_mismatch"
   | "domain_mismatch"
   | "invalid_challenge"
+  // Thrown by core's atomicAmountString, reached through buildPaymentHeader and
+  // challengePriceUsd — i.e. any malformed amount on the signing path.
+  | "invalid_amount"
   | "ingest_timeout";
 
 /**
