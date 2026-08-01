@@ -195,10 +195,17 @@ describe("ingest: client-side validation runs BEFORE any request", () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
-  it("RAG_MODELS covers every RagModelId this SDK declares", () => {
-    // Compile-time-checked (RAG_MODELS is declared `satisfies readonly RagModelId[]`) that
-    // every listed id IS a real RagModelId; this asserts the OTHER direction — that the
-    // model-validation allowlist hasn't quietly fallen behind the type union it mirrors.
+  it("RAG_MODELS lists exactly these four ids (value-level regression pin)", () => {
+    // Renamed in fix round 2: this is NOT an exhaustiveness proof — `expected: RagModelId[]`
+    // type-checks fine as any SUBSET of RagModelId, so it could not have caught RagModelId
+    // outgrowing RAG_MODELS (a prior version of this test's own comment incorrectly claimed
+    // it did). That invariant is now enforced separately, at compile time, by
+    // `RagModelsAreExhaustive` beside RAG_MODELS's own declaration in index.ts — which fails
+    // `tsc` directly the moment they disagree, rather than depending on this test noticing.
+    // What THIS test catches is narrower but still real and distinct: an accidental edit to
+    // RAG_MODELS's own listed VALUES (a typo, a duplicate, a dropped entry) that a pure
+    // type-level check can't see, since each remaining string is still individually a valid
+    // RagModelId either way.
     const expected: RagModelId[] = [
       "@cf/baai/bge-m3",
       "@cf/baai/bge-large-en-v1.5",

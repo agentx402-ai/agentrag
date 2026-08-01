@@ -68,11 +68,12 @@ export const DEFAULT_MODEL: RagModelId = "@cf/baai/bge-m3";
  * fixed embedding dimension plus a specific Vectorize index binding — a fifth model requires
  * a worker code change, a deploy, and (for a new dimension) a new index, never a silent
  * server-side addition the SDK could fall behind on unnoticed. `satisfies readonly
- * RagModelId[]` is a compile-time check that every entry here is a real `RagModelId` (catches
- * a typo at build time, before it ever reaches a runtime check). Task 14 (cross-repo parity)
- * should compare this array against the worker's own model catalog keys, the same
- * "duplicated by contract, cross-checked by CI" pattern already used for every other
- * price/limit this SDK mirrors.
+ * RagModelId[]` is a compile-time check that every entry here IS a real `RagModelId`; the
+ * OTHER direction — that every `RagModelId` is listed HERE — is enforced immediately below
+ * by `RagModelsAreExhaustive`, not by this clause (see that type's own doc comment for why
+ * the two are not the same check). Task 14 (cross-repo parity) should compare this array
+ * against the worker's own model catalog keys, the same "duplicated by contract,
+ * cross-checked by CI" pattern already used for every other price/limit this SDK mirrors.
  */
 export const RAG_MODELS = [
   "@cf/baai/bge-m3",
@@ -80,6 +81,34 @@ export const RAG_MODELS = [
   "@cf/qwen/qwen3-embedding-0.6b",
   "@cf/google/embeddinggemma-300m",
 ] as const satisfies readonly RagModelId[];
+
+/**
+ * EXPLICIT compile-time exhaustiveness guard for RAG_MODELS, independent of how
+ * `RAG_MODELS.includes(...)` happens to be called below (fix round 2 — the review this
+ * closes). Before this guard, the ONLY thing catching `RagModelId` (types.ts) outgrowing
+ * `RAG_MODELS` was `Array.prototype.includes`'s narrow `searchElement: T` parameter
+ * rejecting a widened union at the `.includes()` call site — real, but incidental and
+ * undocumented: nothing said it was load-bearing, and it is one refactor from silent
+ * deletion. Widening that call to `(RAG_MODELS as readonly string[]).includes(...)` — the
+ * natural way to silence a confusing "Argument of type X is not assignable" error someone
+ * hits there after adding a model to the union — compiles clean and passes every test,
+ * while restoring the exact strict-compile/loose-runtime split RAG_MODELS exists to close:
+ * a model the TYPE allows but the ARRAY doesn't list would then be accepted by the compiler
+ * and rejected at runtime, silently.
+ *
+ * `Exclude<RagModelId, (typeof RAG_MODELS)[number]>` is every `RagModelId` member NOT
+ * present in `RAG_MODELS` — `never` iff there are none. This check does not depend on the
+ * `.includes()` call at all, so widening that call cannot silence it. The `const` assignment
+ * below is what actually FORCES the type to be evaluated: a type alias nobody references
+ * produces no diagnostic even when it stops being `true` — assigning `true` to a binding
+ * TYPED `false` does. A `RagModelId` addition that forgets to also list the string in
+ * `RAG_MODELS` fails `tsc` right here, naming this line, not a confusing error at an
+ * unrelated call site three files away.
+ */
+type RagModelsAreExhaustive =
+  Exclude<RagModelId, (typeof RAG_MODELS)[number]> extends never ? true : false;
+const _ragModelsAreExhaustive: RagModelsAreExhaustive = true;
+void _ragModelsAreExhaustive; // exists ONLY to force the type check above; never read
 
 // Pinned prices (USD) — parity-guarded against the worker's own price registry by a
 // cross-repo CI check. The wire price always comes from the server's 402 challenge;
