@@ -1,0 +1,40 @@
+{
+  "name": "@agentrag/cli",
+  "version": "0.1.0",
+  "description": "AgentRAG CLI + `agentrag mcp` MCP server.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/agentx402-ai/agentrag.git",
+    "directory": "cli"
+  },
+  "type": "module",
+  "bin": {
+    "agentrag": "./dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20.3"
+  },
+  "scripts": {
+    "build": "tsup",
+    "test": "tsc --noEmit && vitest run",
+    "test:coverage": "vitest run --coverage",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@agentrag/client": "^0.1.0",
+    "viem": "^2.55.10"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsup": "^8.3.0",
+    "typescript": "^5.6.0",
+    "vitest": "^4.1.0"
+  }
+}

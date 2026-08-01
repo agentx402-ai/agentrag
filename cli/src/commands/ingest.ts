@@ -1,0 +1,74 @@
+import { readFileSync } from "node:fs";
+import type { IngestDocument, IngestOptions } from "@agentrag/client";
+import { parseFlags, UsageError } from "../args";
+import { EXIT, printError, printJson, type Writer } from "../output";
+
+type IngestClient = {
+  ingest: (o: IngestOptions) => Promise<unknown>;
+};
+
+/**
+ * Load `--documents FILE`: a JSON file containing an array of `{text, title?, url?}` objects
+ * (the SDK's own IngestDocument shape). Deeper validation (text is a string, size limits) is
+ * left to the client (assertValidDocuments), which runs before any network call either way —
+ * this only needs to fail loud on "not a file", "not JSON", and "not an array" so a typo'd
+ * path is a clean usage error rather than a raw fs/JSON exception.
+ */
+function loadDocuments(path: string): IngestDocument[] {
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch (e) {
+    throw new UsageError(
+      `--documents file ${path} could not be read: ${e instanceof Error ? e.message : String(e)}`,
+    );
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new UsageError(`--documents file ${path} is not valid JSON`);
+  }
+  if (!Array.isArray(parsed)) {
+    throw new UsageError(`--documents file ${path} must contain a JSON array of documents`);
+  }
+  return parsed as IngestDocument[];
+}
+
+export async function runIngest(
+  args: string[],
+  io: { client: IngestClient; stdout: Writer; stderr: Writer },
+): Promise<number> {
+  const { flags } = parseFlags(args);
+  const f = flags as {
+    sources?: string[];
+    documents?: string;
+    collection?: string;
+    model?: IngestOptions["model"];
+    maxPages?: number;
+    refresh?: boolean;
+  };
+  let documents: IngestDocument[] | undefined;
+  if (f.documents !== undefined) {
+    try {
+      documents = loadDocuments(f.documents);
+    } catch (e) {
+      if (e instanceof UsageError) {
+        printError(io.stderr, "usage", e.message);
+        return EXIT.USAGE;
+      }
+      throw e;
+    }
+  }
+  const opts: IngestOptions = {
+    sources: f.sources,
+    documents,
+    collection: f.collection,
+    model: f.model,
+    maxPages: f.maxPages,
+    refresh: f.refresh,
+  };
+  const result = await io.client.ingest(opts);
+  printJson(io.stdout, result);
+  return EXIT.OK;
+}
