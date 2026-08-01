@@ -85,35 +85,36 @@ describe("runCli dispatch", () => {
   });
 });
 
-describe("runCli `mcp` (a placeholder ahead of Task 9's real server)", () => {
-  it("is a recognized command, not `unknown command`", async () => {
-    const err: string[] = [];
-    const code = await runCli(["mcp"], {
-      stdout: sink,
-      stderr: (s) => err.push(s),
-    });
-    expect(code).not.toBe(EXIT.USAGE);
-    expect(JSON.parse(err.join("")).code).not.toBe("usage");
-  });
-
-  it("fails with a typed not_implemented error, through the SAME error handler as every other command", async () => {
-    const out: string[] = [];
-    const err: string[] = [];
-    const code = await runCli(["mcp"], {
-      stdout: (s) => out.push(s),
-      stderr: (s) => err.push(s),
-    });
-    expect(code).toBe(EXIT.GENERIC);
-    expect(JSON.parse(err.join("")).code).toBe("not_implemented");
-    expect(out.join("")).toBe(""); // no stdout noise on the placeholder path either
-  });
-});
-
 describe("runCli dispatches every command inside one error handler", () => {
   // Regression (per the Scout template this closes): `mcp` and `wallet` were dispatched ABOVE
   // the try/catch, so a throw from resolveConfig/readConfigFile/peekStoredAccount escaped
   // runCli instead of becoming the same typed {error, code} line every other command produces.
   const CORRUPT = '{ "endpoint": ';
+
+  it("a corrupt config.json on the `mcp` path is a typed error, not an unhandled rejection", async () => {
+    const home = mkdtempSync(join(tmpdir(), "agentrag-mcp-cfg-"));
+    const out: string[] = [];
+    const err: string[] = [];
+    try {
+      writeFileSync(join(home, "config.json"), CORRUPT);
+      // Pre-fix (the Task 9 stub swap) this either rejected uncaught or never reached
+      // resolveConfig at all, so awaiting it either threw out of the test or returned
+      // not_implemented regardless of the config. Now `mcp` calls startMcp -> resolveConfig
+      // inside the SAME try/catch as every other command.
+      const code = await runCli(["mcp"], {
+        env: { AGENTRAG_HOME: home },
+        stdout: (s) => out.push(s),
+        stderr: (s) => err.push(s),
+      });
+      expect(code).toBe(EXIT.GENERIC);
+      expect(JSON.parse(err.join("")).code).toBe("invalid_config");
+      expect(err.join("")).toContain("config.json");
+      // stdout is the MCP JSON-RPC channel: diagnostics must never land there.
+      expect(out.join("")).toBe("");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
 
   it("a corrupt config.json on a verb path is a typed error", async () => {
     const home = mkdtempSync(join(tmpdir(), "agentrag-verb-cfg-"));

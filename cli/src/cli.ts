@@ -69,16 +69,10 @@ export async function runCli(
   // stack trace instead of the reason.
   try {
     if (cmd === "mcp") {
-      // Task 9 implements the real MCP server (cli/src/mcp.ts's startMcp()). `mcp` is
-      // recognized as a command here (see the KNOWN check above and HELP) so it fails with a
-      // clear, typed error instead of "unknown command" in the meantime — inside this SAME
-      // try/catch, so it goes through mapError exactly like every other command once the real
-      // dispatch (a dynamic `import("./mcp.js")`, mirroring the Scout template) replaces this.
-      throw new AgentRagError(
-        "agentrag mcp is not implemented in this build yet",
-        "not_implemented",
-        0,
-      );
+      const { startMcp } = await import("./mcp.js");
+      // `await`, not a bare return: returning the promise would hand the rejection back to the
+      // caller UNCAUGHT, which is precisely the bug this try/catch exists to close.
+      return await startMcp({ env, stderr });
     }
     if (cmd === "wallet") {
       // Dispatched BEFORE the shared client construction below: clientFromConfig MINTS a
