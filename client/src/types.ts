@@ -2,10 +2,10 @@ import type { Signer, UsageBlock } from "@agentx402-ai/core";
 
 export type { Signer, UsageBlock };
 
-// TEMPORARY WORKAROUND (tracked in the task list as "Release core 0.4.0
-// (breakdown/expiring_soon)", owner-gated; ruling confirmed independently by the
-// controller, who verified the installed node_modules/@agentx402-ai/core/dist/index.d.ts
-// directly): the PUBLISHED @agentx402-ai/core@0.3.0 predates the commit that added
+// WORKAROUND FOR A REAL VERSION SKEW (tracked in the task list as "Release core 0.4.0
+// (breakdown/expiring_soon)", owner-gated; confirmed independently by the controller, who
+// verified the installed node_modules/@agentx402-ai/core/dist/index.d.ts directly): the
+// PUBLISHED @agentx402-ai/core@0.3.0 predates the commit that added
 // `breakdown`/`expiring_soon` to UsageBlock on core's own main branch — core's
 // package.json was never bumped off 0.3.0, so npm's 0.3.0 lacks fields core's own source
 // already carries. The service genuinely emits a breakdown leg on a composite ask (the
@@ -14,8 +14,16 @@ export type { Signer, UsageBlock };
 // re-export of core's own type (for compatibility with anything typed against core
 // directly); `RagUsageBlock` below is an ADDITIONAL, superset export — extended, never
 // redeclared, so the two cannot drift — used wherever this SDK's own wire responses
-// actually carry the two fields. Once core ships 0.4.0 with these fields natively, fold
-// them back: replace each `RagUsageBlock` usage with `UsageBlock` and delete this interface.
+// actually carry the two fields.
+//
+// `RagUsageBlock` IS PART OF THIS PACKAGE'S PUBLIC API, permanently, not a temporary type
+// to delete later — deleting a publicly exported interface is a semver-major break for
+// anyone who imported it, so that was never a safe "eventual cleanup" to promise (an
+// earlier version of this comment did, incorrectly). What DOES change once core ships
+// 0.4.0 with these fields natively: `RagUsageBlock` simplifies to a plain alias
+// (`export type RagUsageBlock = UsageBlock;`), which is NOT a breaking change for any
+// consumer — a type alias to a structurally-identical shape is fully transparent to
+// existing imports of the name.
 export interface RagUsageBlock extends UsageBlock {
   /**
    * Composite-op itemization: additional charge legs beyond the primary verb (e.g. an

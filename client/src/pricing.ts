@@ -28,14 +28,35 @@ import {
 } from "./index";
 
 /**
+ * USD (a decimal float) to atomic USDC units (an integer; USDC has 6 decimals) — matching
+ * how the worker's own price registry represents amounts, and how `PRICE_EPS` elsewhere
+ * in this SDK is already documented as "one atomic unit". `Math.round`, not `Math.floor`
+ * or a bare multiply: a pinned USD constant like 0.008 is not exactly representable in
+ * binary floating point, so `0.008 * 1_000_000` can itself land a hair off 8000 — rounding
+ * is what actually recovers the intended integer.
+ */
+export function usdToAtomic(usd: number): number {
+  return Math.round(usd * 1_000_000);
+}
+
+/**
  * The ask price, expressed as a whole number of ingest-price units, rounded UP so a
  * composite quote never falls short of the ask's real cost. Mirrors the worker's
  * `Math.ceil(askPrice.atomic / ingestPrice.atomic)` — computed here from this SDK's
- * pinned USD prices instead of the worker's atomic ones (the ratio is identical either
- * way). Today's prices put this at 2 (0.008 / 0.005 = 1.6 -> ceil 2).
+ * pinned USD prices, converted to atomic integers FIRST via `usdToAtomic`, matching the
+ * worker's own integer division rather than dividing the USD floats directly.
+ *
+ * M3: a plain `Math.ceil(ASK_BASE_USD / INGEST_PAGE_USD)` is not equivalent to the
+ * worker's atomic-integer division in general — verified for every (ask, ingest) atomic
+ * pair in 1..3000, the float form is never LOWER (so it can never falsely reject an
+ * honest quote) but can be exactly one unit HIGHER whenever the true ratio lands on a
+ * whole number (e.g. atomic 33000/11000 -> worker/atomic 3, plain float form 4 — see
+ * pricing.test.ts, which pins this exact pair). Today's real prices give 2 either way
+ * (0.008/0.005 = 1.6 -> ceil 2), but a future price change landing on a whole ratio would
+ * let this authorize one ingest unit ($0.005) more than the worker could ever quote.
  */
 export function ceilAskUnits(): number {
-  return Math.ceil(ASK_BASE_USD / INGEST_PAGE_USD);
+  return Math.ceil(usdToAtomic(ASK_BASE_USD) / usdToAtomic(INGEST_PAGE_USD));
 }
 
 /**

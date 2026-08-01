@@ -24,6 +24,7 @@ import type {
   AskPending,
   AskResult,
   RagModelId,
+  RagUsageBlock,
   Signer,
 } from "./types";
 
@@ -518,6 +519,17 @@ export class AgentRag {
       }
     }
     if (opts.sources !== undefined) {
+      // M4: mirrors the worker's own parseAskBody ("sources, if present, must be a
+      // non-empty array") — an empty array passes the per-entry loop below vacuously
+      // (zero iterations) and would otherwise reach the network only to be 400'd,
+      // burning a real EIP-3009 signature in wallet mode first.
+      if (opts.sources.length === 0) {
+        throw new AgentRagError(
+          "sources, if present, must be a non-empty array",
+          "invalid_request",
+          0,
+        );
+      }
       for (const source of opts.sources) assertValidSource(source);
     }
     if (opts.sources === undefined && opts.collection === undefined) {
@@ -551,12 +563,32 @@ export class AgentRag {
         body: JSON.stringify(body),
       }),
       parseSuccess: async (res) => {
-        const parsed = JSON.parse(await res.text()) as AskResult | AskPending;
+        // C1 fix: the worker wraps every success body in `{ data, request_id, usage? }`
+        // (`dataResponse`, the service's HTTP envelope helper) — `data` carries the
+        // verb-specific fields (AskResult's or AskPending's own shape), `usage` and
+        // `request_id` are envelope-level siblings, NOT nested inside `data`. Parsing
+        // this flat (as the prior round did) leaves every `data`-half field
+        // `undefined` at runtime despite typechecking fine against AskResult/AskPending.
+        const env = JSON.parse(await res.text()) as {
+          data: Omit<
+            AskResult | AskPending,
+            "usage" | "request_id" | "settledTxHash" | "creditsRemaining"
+          >;
+          usage?: RagUsageBlock;
+          request_id?: string;
+        };
+        // Cast needed: TS spreads a UNION-typed value conservatively, keeping only
+        // properties common to EVERY union member (here just `collection`) as certain
+        // — it does not re-verify the result against AskResult | AskPending on its
+        // own. The shape is already pinned by `env`'s own type assertion above; this
+        // cast just carries that same trust through the spread, not a new one.
         return {
-          ...parsed,
+          ...env.data,
+          usage: env.usage,
+          request_id: env.request_id,
           settledTxHash: settledTxHash(res),
           creditsRemaining: creditsRemaining(res),
-        };
+        } as AskResult | AskPending;
       },
     });
   }
@@ -584,6 +616,27 @@ export class AgentRag {
     opts: AskOptions & { maxWaitMs?: number; pollIntervalMs?: number } = {},
   ): Promise<AskResult> {
     const { maxWaitMs, pollIntervalMs, ...askOpts } = opts;
+    // I1: a non-finite or non-positive maxWaitMs makes `deadline` non-finite, which
+    // poisons `remaining` (NaN) downstream — `NaN <= 0` is `false`, so the timeout can
+    // NEVER fire, and `Math.min(interval, NaN)` is also NaN, which `setTimeout` treats
+    // as 0: an unbounded, zero-delay poll loop (a real signed request each time in
+    // wallet mode). Validated here, before the first `ask()`, like every other bound.
+    if (maxWaitMs !== undefined && !(Number.isFinite(maxWaitMs) && maxWaitMs > 0)) {
+      throw new AgentRagError(
+        `maxWaitMs must be a finite positive number of milliseconds (got ${maxWaitMs})`,
+        "invalid_request",
+        0,
+      );
+    }
+    // pollIntervalMs: 0 is deliberately VALID (poll immediately, no backoff) — only
+    // non-finite or negative values are rejected.
+    if (pollIntervalMs !== undefined && !(Number.isFinite(pollIntervalMs) && pollIntervalMs >= 0)) {
+      throw new AgentRagError(
+        `pollIntervalMs must be a finite non-negative number of milliseconds (got ${pollIntervalMs})`,
+        "invalid_request",
+        0,
+      );
+    }
     const deadline = Date.now() + (maxWaitMs ?? DEFAULT_ASK_WAIT_MS);
 
     let result = await this.ask(query, askOpts);
@@ -623,11 +676,34 @@ export class AgentRag {
   }
 
   /**
+   * Per-attempt auth headers for `pollIngestJobState`. Computed FRESH on every call —
+   * I2: core's `fetchWithRetry` calls `build()` once per attempt specifically so
+   * per-request material (an identity signature's nonce/timestamp) can be regenerated;
+   * a caller that builds headers once and hands the SAME object to every attempt
+   * defeats that, reusing one nonce/timestamp across retries. Spread into a fresh object
+   * literal so both branches unify on plain Record<string, string> (IdentityHeaders has
+   * no index signature of its own).
+   */
+  protected async pollHeaders(path: string): Promise<Record<string, string>> {
+    return this.accountKey
+      ? buildBearerHeaders(this.accountKey)
+      : {
+          ...(await buildIdentityHeaders(this.requireSigner(), {
+            method: "GET",
+            path,
+            host: new URL(this.endpoint).host,
+            network: this.network,
+          })),
+        };
+  }
+
+  /**
    * Minimal internal poll of a collection's ingest-job state, used ONLY by `askAndWait`.
    * `GET /v1/rag/collection/:id` is a FREE, identity-signed (or bearer, in account-key
    * mode) route — never x402 — so this bypasses `performOp` (built for the paid dance)
-   * entirely. Returns `undefined` when the response carries no `job` block (nothing ever
-   * ran there), which `askAndWait` treats the same as a terminal state (not "running").
+   * entirely. Returns `undefined` when the response's `data` half carries no `job` block
+   * (nothing ever ran there), which `askAndWait` treats the same as a terminal state
+   * (not "running").
    *
    * NOT the public `status()` surface — that is a later task's job (full
    * `CollectionStatus` parsing, error mapping, public API). This helper reads only the
@@ -638,26 +714,19 @@ export class AgentRag {
     collection: string,
   ): Promise<"running" | "complete" | "failed" | undefined> {
     const path = `/v1/rag/collection/${encodeURIComponent(collection)}`;
-    // Spread into a fresh object literal so both branches unify on plain
-    // Record<string, string> (IdentityHeaders has no index signature of its own).
-    const headers: Record<string, string> = this.accountKey
-      ? buildBearerHeaders(this.accountKey)
-      : {
-          ...(await buildIdentityHeaders(this.requireSigner(), {
-            method: "GET",
-            path,
-            host: new URL(this.endpoint).host,
-            network: this.network,
-          })),
-        };
-    const res = await this.fetchWithRetry(`${this.endpoint}${path}`, () => ({
+    const res = await this.fetchWithRetry(`${this.endpoint}${path}`, async () => ({
       method: "GET",
-      headers,
+      headers: await this.pollHeaders(path),
     }));
     if (!res.ok) throw await this.asError(res, "collection status failed");
+    // C2 fix: this route's success body is ALSO the `{ data, request_id }` envelope
+    // (`routeCollectionStatus` returns `dataResponse(200, statusData(meta), requestId)`,
+    // and `statusData` nests `job` inside its own `data` half) — `body.job` is always
+    // `undefined`. The prior round's bug: `askAndWait` treats `undefined` as terminal,
+    // so it exited the wait after exactly one poll regardless of the job's real state.
     const body = (await res.json()) as {
-      job?: { state: "running" | "complete" | "failed" };
+      data?: { job?: { state: "running" | "complete" | "failed" } };
     };
-    return body.job?.state;
+    return body.data?.job?.state;
   }
 }

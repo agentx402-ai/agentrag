@@ -3,6 +3,13 @@ import { describe, expect, it, vi } from "vitest";
 import { AgentRag, AgentRagError, SpendCapError } from "../src/index";
 import { askAuthorizedCeilingUsd } from "../src/pricing";
 
+// Every 200/202 fixture in this file mirrors the REAL wire envelope
+// (`the service's HTTP envelope helper`'s `dataResponse`: `{ data, request_id, usage? }`),
+// not the SDK's own flattened result types — verified against the worker's own
+// `ask-route.test.ts`, which asserts `body.data.*` throughout. A fixture written from
+// `AskResult`'s shape instead of the wire shape is exactly the blind spot that let a
+// broken production path pass 97/97 tests in the prior round.
+
 const endpoint = "https://rag.example";
 const signer = privateKeyToAccount(generatePrivateKey());
 const AK = `ak_${"a".repeat(64)}`;
@@ -26,6 +33,19 @@ function challenge(amount: string): string {
       ],
     }),
   );
+}
+
+/** A worker-shaped ask 200 envelope: `{data: {...}, usage?, request_id?}`. */
+function askEnvelope(
+  data: Record<string, unknown>,
+  extra: { usage?: unknown; request_id?: string } = {},
+) {
+  return { data, ...extra };
+}
+
+/** A worker-shaped collection-status 200 envelope (free route: no `usage`). */
+function statusEnvelope(data: Record<string, unknown>, requestId = "r-status") {
+  return { data, request_id: requestId };
 }
 
 describe("ask: client-side validation runs BEFORE any request", () => {
@@ -150,6 +170,24 @@ describe("ask: client-side validation runs BEFORE any request", () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
+  it("an empty sources array throws invalid_request with NO request issued (M4)", async () => {
+    // Distinct from the malformed-entry cases above: `sources: []` passes the per-entry
+    // loop vacuously (zero iterations) AND passes "at least one of sources/collection"
+    // (sources IS defined) — the worker's own parseAskBody rejects it separately
+    // ("sources, if present, must be a non-empty array"), so the client must too, or a
+    // wallet-mode caller burns a real EIP-3009 signature on a request the worker 400s.
+    const fetchImpl = vi.fn();
+    const client = new AgentRag({
+      signer,
+      endpoint,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    await expect(client.ask("hi", { sources: [] })).rejects.toMatchObject({
+      code: "invalid_request",
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
   it("neither sources nor collection throws invalid_request with NO request issued", async () => {
     const fetchImpl = vi.fn();
     const client = new AgentRag({
@@ -164,8 +202,8 @@ describe("ask: client-side validation runs BEFORE any request", () => {
   });
 });
 
-describe("ask: happy paths", () => {
-  it("a paid ask (flat price, wallet mode) returns chunks and surfaces usage", async () => {
+describe("ask: happy paths (envelope-wrapped fixtures — see file header)", () => {
+  it("a paid ask (flat price, wallet mode) unwraps data/usage/request_id and returns chunks", async () => {
     let calls = 0;
     const fetchImpl = (async (_u: unknown, init?: RequestInit) => {
       calls++;
@@ -176,20 +214,26 @@ describe("ask: happy paths", () => {
         });
       }
       return new Response(
-        JSON.stringify({
-          collection: "c1",
-          expires_at: "2026-09-01T00:00:00.000Z",
-          matched: true,
-          chunks: [{ text: "hi", score: 0.9, url: null, title: null, position: 0 }],
-          usage: {
-            service: "rag",
-            op: "ask",
-            price_usd: 0.008,
-            list_price_usd: 0.008,
-            credits_charged: 0,
-          },
-          request_id: "r1",
-        }),
+        JSON.stringify(
+          askEnvelope(
+            {
+              collection: "c1",
+              expires_at: "2026-09-01T00:00:00.000Z",
+              matched: true,
+              chunks: [{ text: "hi", score: 0.9, url: null, title: null, position: 0 }],
+            },
+            {
+              usage: {
+                service: "rag",
+                op: "ask",
+                price_usd: 0.008,
+                list_price_usd: 0.008,
+                credits_charged: 0,
+              },
+              request_id: "r1",
+            },
+          ),
+        ),
         { status: 200, headers: { "X-AgentKV-Credits-Remaining": "42" } },
       );
     }) as unknown as typeof fetch;
@@ -197,8 +241,12 @@ describe("ask: happy paths", () => {
 
     const result = await client.ask("what is x", { collection: "c1" });
     if (!("chunks" in result)) throw new Error("expected AskResult, got AskPending");
+    expect(result.collection).toBe("c1");
+    expect(result.matched).toBe(true);
     expect(result.chunks).toHaveLength(1);
+    expect(result.chunks[0]?.text).toBe("hi");
     expect(result.usage?.price_usd).toBe(0.008);
+    expect(result.request_id).toBe("r1");
     expect(result.creditsRemaining).toBe(42);
     expect(result.settledTxHash).toBe(""); // no PAYMENT-RESPONSE header on this fixture
     expect(calls).toBe(2); // bare probe, then the paid retry
@@ -209,32 +257,41 @@ describe("ask: happy paths", () => {
     const fetchImpl = (async (_u: unknown, init?: RequestInit) => {
       calls.push(init ?? {});
       return new Response(
-        JSON.stringify({
-          collection: "c1",
-          expires_at: "2026-09-01T00:00:00.000Z",
-          matched: true,
-          chunks: [],
-        }),
+        JSON.stringify(
+          askEnvelope({
+            collection: "c1",
+            expires_at: "2026-09-01T00:00:00.000Z",
+            matched: true,
+            chunks: [],
+          }),
+        ),
         { status: 200 },
       );
     }) as unknown as typeof fetch;
     const client = new AgentRag({ accountKey: AK, endpoint, fetchImpl });
 
-    await client.ask("what is x", { collection: "c1" });
+    const result = await client.ask("what is x", { collection: "c1" });
     expect(calls).toHaveLength(1);
     expect(new Headers(calls[0].headers).get("Authorization")).toBe(`Bearer ${AK}`);
+    if (!("chunks" in result)) throw new Error("expected AskResult, got AskPending");
+    expect(result.collection).toBe("c1");
   });
 
-  it("a 202 resolves as AskPending, not an error", async () => {
+  it("a 202 unwraps data and resolves as AskPending, not an error", async () => {
     const fetchImpl = (async () =>
       new Response(
-        JSON.stringify({
-          collection: "c1",
-          status: "ingesting",
-          pages_done: 1,
-          pages_total: 5,
-          retry_after: 15,
-        }),
+        JSON.stringify(
+          askEnvelope(
+            {
+              collection: "c1",
+              status: "ingesting",
+              pages_done: 1,
+              pages_total: 5,
+              retry_after: 15,
+            },
+            { request_id: "r2" },
+          ),
+        ),
         { status: 202 },
       )) as unknown as typeof fetch;
     const client = new AgentRag({ accountKey: AK, endpoint, fetchImpl });
@@ -248,6 +305,7 @@ describe("ask: happy paths", () => {
       pages_done: 1,
       pages_total: 5,
       retry_after: 15,
+      request_id: "r2",
     });
   });
 });
@@ -285,12 +343,14 @@ describe("ask: composite-aware authorized ceiling (spec §11.3)", () => {
       if (init && new Headers(init.headers).get("PAYMENT-SIGNATURE")) {
         signed = true;
         return new Response(
-          JSON.stringify({
-            collection: "c1",
-            expires_at: "2026-09-01T00:00:00.000Z",
-            matched: true,
-            chunks: [],
-          }),
+          JSON.stringify(
+            askEnvelope({
+              collection: "c1",
+              expires_at: "2026-09-01T00:00:00.000Z",
+              matched: true,
+              chunks: [],
+            }),
+          ),
           { status: 200 },
         );
       }
@@ -304,6 +364,63 @@ describe("ask: composite-aware authorized ceiling (spec §11.3)", () => {
     const result = await client.ask("hi", { sources: ["https://a.com"] });
     expect(signed).toBe(true);
     expect("chunks" in result).toBe(true);
+  });
+});
+
+describe("askAndWait: maxWaitMs / pollIntervalMs validation (I1)", () => {
+  it("a NaN maxWaitMs throws invalid_request with NO request issued", async () => {
+    const fetchImpl = vi.fn();
+    const client = new AgentRag({
+      accountKey: AK,
+      endpoint,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    await expect(
+      client.askAndWait("hi", { collection: "c1", maxWaitMs: Number.NaN }),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("a zero or negative maxWaitMs throws invalid_request with NO request issued", async () => {
+    const fetchImpl = vi.fn();
+    const client = new AgentRag({
+      accountKey: AK,
+      endpoint,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    await expect(client.askAndWait("hi", { collection: "c1", maxWaitMs: 0 })).rejects.toMatchObject(
+      { code: "invalid_request" },
+    );
+    await expect(
+      client.askAndWait("hi", { collection: "c1", maxWaitMs: -1 }),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("a NaN pollIntervalMs throws invalid_request with NO request issued", async () => {
+    const fetchImpl = vi.fn();
+    const client = new AgentRag({
+      accountKey: AK,
+      endpoint,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    await expect(
+      client.askAndWait("hi", { collection: "c1", pollIntervalMs: Number.NaN }),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("a negative pollIntervalMs throws invalid_request with NO request issued", async () => {
+    const fetchImpl = vi.fn();
+    const client = new AgentRag({
+      accountKey: AK,
+      endpoint,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    await expect(
+      client.askAndWait("hi", { collection: "c1", pollIntervalMs: -1 }),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 });
 
@@ -322,61 +439,81 @@ describe("askAndWait", () => {
       if (step === 1) {
         // initial ask (account-key: one bearer call) -> still ingesting
         return new Response(
-          JSON.stringify({
-            collection: "c1",
-            status: "ingesting",
-            pages_done: 0,
-            pages_total: 1,
-            retry_after: 0,
-          }),
+          JSON.stringify(
+            askEnvelope({
+              collection: "c1",
+              status: "ingesting",
+              pages_done: 0,
+              pages_total: 1,
+              retry_after: 0,
+            }),
+          ),
           { status: 202 },
         );
       }
       if (step === 2) {
         // first poll -> still running
         return new Response(
-          JSON.stringify({
-            collection: "c1",
-            model: "@cf/baai/bge-m3",
-            pages: 0,
-            chunks: 0,
-            created_at: "2026-08-01T00:00:00.000Z",
-            expires_at: "2026-09-01T00:00:00.000Z",
-            job: { pages_done: 0, pages_total: 1, state: "running" },
-          }),
+          JSON.stringify(
+            statusEnvelope({
+              collection: "c1",
+              model: "@cf/baai/bge-m3",
+              pages: 0,
+              chunks: 0,
+              created_at: "2026-08-01T00:00:00.000Z",
+              expires_at: "2026-09-01T00:00:00.000Z",
+              job: { pages_done: 0, pages_total: 1, state: "running" },
+            }),
+          ),
           { status: 200 },
         );
       }
       if (step === 3) {
         // second poll -> complete
         return new Response(
-          JSON.stringify({
-            collection: "c1",
-            model: "@cf/baai/bge-m3",
-            pages: 1,
-            chunks: 4,
-            created_at: "2026-08-01T00:00:00.000Z",
-            expires_at: "2026-09-01T00:00:00.000Z",
-            job: { pages_done: 1, pages_total: 1, state: "complete" },
-          }),
+          JSON.stringify(
+            statusEnvelope({
+              collection: "c1",
+              model: "@cf/baai/bge-m3",
+              pages: 1,
+              chunks: 4,
+              created_at: "2026-08-01T00:00:00.000Z",
+              expires_at: "2026-09-01T00:00:00.000Z",
+              job: { pages_done: 1, pages_total: 1, state: "complete" },
+            }),
+          ),
           { status: 200 },
         );
       }
       // re-ask, targeting the now-resolved collection
       return new Response(
-        JSON.stringify({
-          collection: "c1",
-          expires_at: "2026-09-01T00:00:00.000Z",
-          matched: true,
-          chunks: [{ text: "final", score: 0.9, url: null, title: null, position: 0 }],
-          usage: {
-            service: "rag",
-            op: "ask",
-            price_usd: 0.008,
-            list_price_usd: 0.008,
-            credits_charged: 0,
-          },
-        }),
+        JSON.stringify(
+          askEnvelope(
+            {
+              collection: "c1",
+              expires_at: "2026-09-01T00:00:00.000Z",
+              matched: true,
+              chunks: [
+                {
+                  text: "final",
+                  score: 0.9,
+                  url: null,
+                  title: null,
+                  position: 0,
+                },
+              ],
+            },
+            {
+              usage: {
+                service: "rag",
+                op: "ask",
+                price_usd: 0.008,
+                list_price_usd: 0.008,
+                credits_charged: 0,
+              },
+            },
+          ),
+        ),
         { status: 200 },
       );
     }) as unknown as typeof fetch;
@@ -421,26 +558,30 @@ describe("askAndWait", () => {
     const fetchImpl = (async (_input: unknown, init?: RequestInit) => {
       if ((init?.method ?? "GET") === "POST") {
         return new Response(
-          JSON.stringify({
-            collection: "c1",
-            status: "ingesting",
-            pages_done: 0,
-            pages_total: 1,
-            retry_after: 0,
-          }),
+          JSON.stringify(
+            askEnvelope({
+              collection: "c1",
+              status: "ingesting",
+              pages_done: 0,
+              pages_total: 1,
+              retry_after: 0,
+            }),
+          ),
           { status: 202 },
         );
       }
       return new Response(
-        JSON.stringify({
-          collection: "c1",
-          model: "@cf/baai/bge-m3",
-          pages: 0,
-          chunks: 0,
-          created_at: "2026-08-01T00:00:00.000Z",
-          expires_at: "2026-09-01T00:00:00.000Z",
-          job: { pages_done: 0, pages_total: 1, state: "running" },
-        }),
+        JSON.stringify(
+          statusEnvelope({
+            collection: "c1",
+            model: "@cf/baai/bge-m3",
+            pages: 0,
+            chunks: 0,
+            created_at: "2026-08-01T00:00:00.000Z",
+            expires_at: "2026-09-01T00:00:00.000Z",
+            job: { pages_done: 0, pages_total: 1, state: "running" },
+          }),
+        ),
         { status: 200 },
       );
     }) as unknown as typeof fetch;
@@ -458,17 +599,176 @@ describe("askAndWait", () => {
   it("returns immediately (no polling) when the first ask already resolves", async () => {
     const fetchImpl = (async () =>
       new Response(
-        JSON.stringify({
-          collection: "c1",
-          expires_at: "2026-09-01T00:00:00.000Z",
-          matched: true,
-          chunks: [],
-        }),
+        JSON.stringify(
+          askEnvelope({
+            collection: "c1",
+            expires_at: "2026-09-01T00:00:00.000Z",
+            matched: true,
+            chunks: [],
+          }),
+        ),
         { status: 200 },
       )) as unknown as typeof fetch;
     const client = new AgentRag({ accountKey: AK, endpoint, fetchImpl });
 
     const result = await client.askAndWait("what is x", { collection: "c1" });
     expect(result.matched).toBe(true);
+  });
+
+  it("a status response with no job block at all is treated as terminal (not 'running')", async () => {
+    // C2 regression guard, positive case: a collection with no active/tracked job (e.g. one
+    // that never needed async ingest) must not be mistaken for "still running" — the
+    // documented fallback is deliberate and must still fire once C1/C2 are fixed.
+    let step = 0;
+    const fetchImpl = (async (_input: unknown, init?: RequestInit) => {
+      step++;
+      if ((init?.method ?? "GET") === "POST") {
+        if (step === 1) {
+          return new Response(
+            JSON.stringify(
+              askEnvelope({
+                collection: "c1",
+                status: "ingesting",
+                pages_done: 0,
+                pages_total: 1,
+                retry_after: 0,
+              }),
+            ),
+            { status: 202 },
+          );
+        }
+        return new Response(
+          JSON.stringify(
+            askEnvelope({
+              collection: "c1",
+              expires_at: "2026-09-01T00:00:00.000Z",
+              matched: true,
+              chunks: [],
+            }),
+          ),
+          { status: 200 },
+        );
+      }
+      // poll: no `job` key at all in data (not even `job: undefined` — genuinely absent)
+      return new Response(
+        JSON.stringify(
+          statusEnvelope({
+            collection: "c1",
+            model: "@cf/baai/bge-m3",
+            pages: 1,
+            chunks: 2,
+            created_at: "2026-08-01T00:00:00.000Z",
+            expires_at: "2026-09-01T00:00:00.000Z",
+          }),
+        ),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+    const client = new AgentRag({
+      accountKey: AK,
+      endpoint,
+      fetchImpl,
+      maxRetries: 0,
+    });
+
+    const result = await client.askAndWait("what is x", {
+      sources: ["https://a.com"],
+      pollIntervalMs: 0,
+      maxWaitMs: 5_000,
+    });
+    expect(result.matched).toBe(true);
+    expect(step).toBe(3); // ask (202) -> one poll (absent job => terminal) -> re-ask
+  });
+});
+
+describe("pollIngestJobState (askAndWait's internal poll helper)", () => {
+  // Thin protected-access subclass, mirroring this repo's existing pattern
+  // (spend-caps.test.ts / account-mode.test.ts) for driving a protected method directly.
+  class PollTestClient extends AgentRag {
+    poll(collection: string) {
+      return this.pollIngestJobState(collection);
+    }
+  }
+
+  it("unwraps data.job (C2): a 'running' data.job is read correctly, not misread as absent", async () => {
+    const fetchImpl = (async () =>
+      new Response(
+        JSON.stringify(
+          statusEnvelope({
+            collection: "c1",
+            job: { pages_done: 1, pages_total: 4, state: "running" },
+          }),
+        ),
+        { status: 200 },
+      )) as unknown as typeof fetch;
+    const client = new PollTestClient({ accountKey: AK, endpoint, fetchImpl });
+
+    expect(await client.poll("c1")).toBe("running");
+  });
+
+  it("regenerates identity headers on EVERY retry attempt, not just the first (I2)", async () => {
+    let signCount = 0;
+    const spy = {
+      ...signer,
+      signTypedData: (async (args: Parameters<typeof signer.signTypedData>[0]) => {
+        signCount++;
+        return signer.signTypedData(args);
+      }) as typeof signer.signTypedData,
+    } as typeof signer;
+
+    let attempt = 0;
+    const fetchImpl = (async () => {
+      attempt++;
+      // Transient failure on the first attempt so core's fetchWithRetry retries — build()
+      // is re-invoked per attempt (verified against core/src/retry.ts), so a correctly
+      // fixed pollIngestJobState must sign again on the second attempt.
+      if (attempt === 1) return new Response("{}", { status: 503 });
+      return new Response(
+        JSON.stringify(
+          statusEnvelope({
+            collection: "c1",
+            job: { pages_done: 1, pages_total: 1, state: "complete" },
+          }),
+        ),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+    const client = new PollTestClient({
+      signer: spy,
+      endpoint,
+      fetchImpl,
+      maxRetries: 1,
+    });
+
+    const state = await client.poll("c1");
+    expect(state).toBe("complete");
+    expect(attempt).toBe(2); // proves a retry genuinely happened
+    expect(signCount).toBe(2); // proves headers (and the identity signature) were recomputed per attempt, not cached from the first
+  });
+
+  it("account-key mode never signs (no signer needed) across a retry either", async () => {
+    let attempt = 0;
+    const fetchImpl = (async () => {
+      attempt++;
+      if (attempt === 1) return new Response("{}", { status: 503 });
+      return new Response(
+        JSON.stringify(
+          statusEnvelope({
+            collection: "c1",
+            job: { pages_done: 1, pages_total: 1, state: "complete" },
+          }),
+        ),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+    const client = new PollTestClient({
+      accountKey: AK,
+      endpoint,
+      fetchImpl,
+      maxRetries: 1,
+    });
+
+    expect(await client.poll("c1")).toBe("complete");
+    expect(attempt).toBe(2);
   });
 });

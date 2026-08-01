@@ -5,6 +5,7 @@ import {
   ceilAskUnits,
   extendAuthorizedCeilingUsd,
   ingestAuthorizedCeilingUsd,
+  usdToAtomic,
   worstCaseIngestPages,
 } from "../src/pricing";
 
@@ -15,6 +16,27 @@ import {
 describe("ceilAskUnits", () => {
   it("mirrors the worker's ceil(askPrice / ingestPrice) ratio", () => {
     expect(ceilAskUnits()).toBe(2); // ceil(0.008 / 0.005) = ceil(1.6) = 2
+  });
+
+  it("M3: computes via atomic integers, not a plain USD-float division", () => {
+    // Regression for a real defect class: Math.ceil(askUsd / ingestUsd) — plain float
+    // division — can be exactly ONE UNIT HIGHER than Math.ceil(askAtomic / ingestAtomic)
+    // — the worker's own division — whenever the true ratio is a whole number. Verified
+    // empirically: 0.033/0.011 floats to a value whose ceiling is 4, even though the true
+    // atomic ratio 33000/11000 is exactly 3. usdToAtomic (Math.round(usd * 1_000_000))
+    // recovers the exact integer before dividing, matching the worker.
+    expect(Math.ceil(0.033 / 0.011)).toBe(4); // the bug, demonstrated directly: WRONG
+    expect(Math.ceil(usdToAtomic(0.033) / usdToAtomic(0.011))).toBe(3); // the fix: correct
+    // Same shape as the ask/ingest ratio ceilAskUnits actually computes, at prices where
+    // the discrepancy would bite (today's real $0.008/$0.005 doesn't happen to trigger it).
+    expect(Math.ceil(0.035 / 0.005)).toBe(8); // the bug: WRONG (true ratio is exactly 7)
+    expect(Math.ceil(usdToAtomic(0.035) / usdToAtomic(0.005))).toBe(7); // the fix: correct
+  });
+
+  it("usdToAtomic converts a pinned USD price to its exact atomic integer", () => {
+    expect(usdToAtomic(ASK_BASE_USD)).toBe(8_000);
+    expect(usdToAtomic(INGEST_PAGE_USD)).toBe(5_000);
+    expect(usdToAtomic(EXTEND_BLOCK_USD)).toBe(10_000);
   });
 });
 
