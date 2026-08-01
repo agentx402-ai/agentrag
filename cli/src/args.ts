@@ -40,11 +40,68 @@ const NUM_FLAGS = new Set(["max-spend-usd", "max-session-spend-usd", "top-k", "m
 // more than once (`agentrag ask <query> --sources URL --sources URL ...`).
 const MULTI_FLAGS = new Set(["sources"]);
 
+/**
+ * Global config flags — valid alongside ANY command. `cli.ts` consumes these itself (a single
+ * `parseFlags(rest).flags` call feeding `resolveConfig`, BEFORE dispatching into the specific
+ * command) — a verb command's OWN (second) `parseFlags` call never reads them again, but must
+ * still tolerate their presence so `agentrag ask "q" --max-spend-usd 5 --collection docs` keeps
+ * working. Every per-command allowlist below spreads this set in for exactly that reason.
+ */
+export const GLOBAL_FLAGS: ReadonlySet<string> = new Set([
+  "endpoint",
+  "network",
+  "max-spend-usd",
+  "max-session-spend-usd",
+]);
+
+// Per-command flag allowlists — closes the review finding "every command accepts every other
+// command's flags and silently drops them" (e.g. `agentrag ask q --refresh` used to parse clean
+// and do nothing: AskOptions has no `refresh` wiring in ask.ts, so the flag was silently
+// dropped — a billing-relevant surprise, since a user asking for "fresh" data silently got a
+// cached collection instead). Each command below passes its own set as parseFlags's `allowed`
+// param, so a flag that's globally known but wrong for THIS command is now a usage error
+// instead of a no-op.
+export const ASK_FLAGS: ReadonlySet<string> = new Set([
+  ...GLOBAL_FLAGS,
+  "sources",
+  "collection",
+  "top-k",
+  "mode",
+  "max-pages",
+  "wait",
+]);
+export const INGEST_FLAGS: ReadonlySet<string> = new Set([
+  ...GLOBAL_FLAGS,
+  "sources",
+  "documents",
+  "collection",
+  "model",
+  "max-pages",
+  "refresh",
+]);
+export const EXTEND_FLAGS: ReadonlySet<string> = new Set([...GLOBAL_FLAGS, "days"]);
+export const STATUS_FLAGS: ReadonlySet<string> = new Set(GLOBAL_FLAGS);
+export const DELETE_FLAGS: ReadonlySet<string> = new Set(GLOBAL_FLAGS);
+// `wallet show` is dispatched BEFORE config resolution and never calls resolveConfig (see
+// cli.ts), so it has no use for the global config flags either — the strictest of the six,
+// accepting none at all.
+export const WALLET_FLAGS: ReadonlySet<string> = new Set();
+
 function camel(k: string): string {
   return k.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
 }
 
-export function parseFlags(args: string[]): {
+/**
+ * @param allowed When given, restricts accepted flags to exactly this set (see the
+ *   per-command *_FLAGS constants above) — a flag outside it is a usage error even when it's
+ *   globally known, so a command can no longer silently accept and drop another command's flag.
+ *   Omitted entirely by cli.ts's own top-level parse (which must tolerate every verb's flags
+ *   alongside the global config ones, since it only extracts the config subset).
+ */
+export function parseFlags(
+  args: string[],
+  allowed?: ReadonlySet<string>,
+): {
   flags: Record<string, unknown>;
   positionals: string[];
 } {
@@ -55,6 +112,9 @@ export function parseFlags(args: string[]): {
     if (a.startsWith("--")) {
       const key = a.slice(2);
       if (!KNOWN_FLAGS.has(key)) throw new UsageError(`unknown flag --${key}`);
+      if (allowed !== undefined && !allowed.has(key)) {
+        throw new UsageError(`flag --${key} is not valid for this command`);
+      }
       const boolish = BOOL_FLAGS.has(key);
       const val = boolish ? true : args[++i];
       // A value-expecting flag MUST get a real value. Missing (`--collection` at end), empty

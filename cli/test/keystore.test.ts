@@ -208,9 +208,15 @@ describe("keystore — account file", () => {
 });
 
 describe("clientFromConfig — account-mode auto-detect", () => {
+  // maxSpendUsd/maxSessionSpendUsd are set to non-default, non-undefined values deliberately —
+  // see the money-cap propagation tests below. A cfgBase that left them undefined would make
+  // those assertions vacuously pass (undefined === undefined) even if clientFromConfig's
+  // plumbing were deleted entirely.
   const cfgBase = {
     endpoint: "https://x.example",
     network: "eip155:8453",
+    maxSpendUsd: 0.5,
+    maxSessionSpendUsd: 2,
   } as const;
   const AK = `ak_${"a".repeat(64)}`;
 
@@ -220,6 +226,24 @@ describe("clientFromConfig — account-mode auto-detect", () => {
       const client = clientFromConfig({ ...cfgBase, accountKey: AK }, { env });
       expect((client as any).accountKey).toBe(AK); // raw bearer is the identity
       expect((client as any).signer).toBeUndefined(); // managed account can't sign
+    } finally {
+      clean(env);
+    }
+  });
+
+  // Review Important: "nothing proves the spend caps reach the constructed client." Deleting
+  // clientFromConfig's `maxSpendUsd`/`maxSessionSpendUsd` plumbing lines passed every other test
+  // in this suite (config.ts only proves resolveConfig COMPUTES the caps, not that they're
+  // HANDED to the SDK) — measured through runCli with a stubbed 402 challenge: 1 signed EIP-3009
+  // authorization went out instead of 0. Both branches of clientFromConfig (account-key and
+  // wallet) share the same `base` object, so either test below alone would already catch a
+  // deletion — both are pinned for resilience against a future per-branch split.
+  it("clientFromConfig hands the spend caps to the constructed client (account-key mode)", () => {
+    const env = tmpEnv();
+    try {
+      const client = clientFromConfig({ ...cfgBase, accountKey: AK }, { env });
+      expect((client as any).maxSpendUsd).toBe(cfgBase.maxSpendUsd);
+      expect((client as any).maxSessionSpendUsd).toBe(cfgBase.maxSessionSpendUsd);
     } finally {
       clean(env);
     }
@@ -244,6 +268,20 @@ describe("clientFromConfig — account-mode auto-detect", () => {
       const client = clientFromConfig({ ...cfgBase, privateKey: `0x${"c".repeat(64)}` }, { env });
       expect((client as any).accountKey).toBeUndefined(); // ...but env privkey wins
       expect((client as any).signer).toBeDefined(); // wallet mode -> a signer
+    } finally {
+      clean(env);
+    }
+  });
+
+  it("clientFromConfig hands the spend caps to the constructed client (wallet mode)", () => {
+    // Same money-safety gap as the account-key test above, pinned on the OTHER branch of
+    // clientFromConfig too — `base` is shared today, but a future per-branch split should not
+    // silently un-guard one side.
+    const env = tmpEnv();
+    try {
+      const client = clientFromConfig({ ...cfgBase, privateKey: `0x${"d".repeat(64)}` }, { env });
+      expect((client as any).maxSpendUsd).toBe(cfgBase.maxSpendUsd);
+      expect((client as any).maxSessionSpendUsd).toBe(cfgBase.maxSessionSpendUsd);
     } finally {
       clean(env);
     }

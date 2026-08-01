@@ -1,10 +1,16 @@
 import { AgentRagError } from "@agentrag/client";
 import { privateKeyToAccount } from "viem/accounts";
-import { parseFlags } from "../args";
+import { parseFlags, WALLET_FLAGS } from "../args";
 import { peekStoredAccount, peekStoredWallet } from "../keystore";
 import { EXIT, printError, printJson, type Writer } from "../output";
 
-const KEY_RE = /^0x[0-9a-fA-F]{64}$/;
+// Case-insensitive on the "0x"/"0X" prefix (the hex digits already tolerate both cases via
+// [0-9a-fA-F]) to match what viem's privateKeyToAccount itself accepts — verified directly:
+// privateKeyToAccount("0X" + "c".repeat(64)) succeeds. A stricter, lowercase-only "0x" here
+// previously made `wallet show` reject a 0X-prefixed key as malformed while clientFromConfig
+// (config.ts) constructed a real client from the SAME key without complaint — the diagnostic
+// command disagreeing with the paying path on what counts as a valid key.
+const KEY_RE = /^0x[0-9a-fA-F]{64}$/i;
 
 /**
  * What the wallet surfaces report. This exact object is printed by `wallet show` AND (Task 9)
@@ -106,7 +112,9 @@ export function runWallet(
   io: { stdout: Writer; stderr: Writer; env?: NodeJS.ProcessEnv },
 ): number {
   // parseFlags so a typo'd flag fails loud here too, rather than being silently ignored.
-  const { positionals } = parseFlags(args);
+  // WALLET_FLAGS is empty — `wallet show` takes no flags at all, not even the global config
+  // ones (it never calls resolveConfig, so they would do nothing but look like they mattered).
+  const { positionals } = parseFlags(args, WALLET_FLAGS);
   if (positionals[0] !== "show") {
     printError(io.stderr, "usage", "wallet show");
     return EXIT.USAGE;

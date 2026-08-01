@@ -1,7 +1,9 @@
-import { parseFlags } from "../args";
+import { EXTEND_FLAGS, parseFlags } from "../args";
 import { EXIT, printError, printJson, type Writer } from "../output";
 
-type ExtendClient = {
+// Exported so tests can type a fake client against the exact shape the real AgentRag must
+// satisfy, instead of erasing the seam with `as never`/`as any`.
+export type ExtendClient = {
   extend: (collection: string, days: 30 | 60 | 90) => Promise<unknown>;
 };
 
@@ -13,7 +15,7 @@ export async function runExtend(
   args: string[],
   io: { client: ExtendClient; stdout: Writer; stderr: Writer },
 ): Promise<number> {
-  const { flags, positionals } = parseFlags(args);
+  const { flags, positionals } = parseFlags(args, EXTEND_FLAGS);
   const collection = positionals[0];
   if (!collection) {
     printError(io.stderr, "usage", "extend requires <collection>");

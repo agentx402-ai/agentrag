@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { AgentRag } from "@agentrag/client";
 import { AgentRagError, AgentXError, SpendCapError } from "@agentrag/client";
 import { describe, expect, it, vi } from "vitest";
 import { runCli } from "../src/cli";
@@ -12,6 +13,24 @@ const sink = () => {};
 // fake `client` is injected (only clientFromConfig is skipped), so tests that inject a client
 // still need a safe home dir rather than falling through to this machine's real ~/.agentrag.
 const FIXTURE_HOME = "/nonexistent-agentrag-cli-test-fixture";
+
+/**
+ * Build a minimal fake AgentRag exposing only the given verb methods. `runCli`'s dispatch only
+ * ever calls ONE of ask/ingest/extend/status/delete per invocation (based on the command), so a
+ * full AgentRag double is unnecessary ceremony for these dispatch/mapError tests — but
+ * `deps.client?: AgentRag` is typed against the real class, which a bare `{status: fn}` object
+ * does not structurally satisfy. One named, justified cast lives HERE instead of at each of the
+ * (previously 10) call sites that wrote `client as any` inline.
+ */
+function fakeAgentRag(methods: {
+  ask?: AgentRag["ask"];
+  ingest?: AgentRag["ingest"];
+  extend?: AgentRag["extend"];
+  status?: AgentRag["status"];
+  delete?: AgentRag["delete"];
+}): AgentRag {
+  return methods as AgentRag;
+}
 
 describe("runCli dispatch", () => {
   it("unknown command -> EXIT.USAGE and a usage error on stderr", async () => {
@@ -209,7 +228,7 @@ describe("runCli error -> exit-code mapping (mapError)", () => {
     };
     const err: string[] = [];
     const code = await runCli(["status", "my-docs"], {
-      client: client as any,
+      client: fakeAgentRag(client),
       env: { AGENTRAG_HOME: FIXTURE_HOME },
       stdout: sink,
       stderr: (s) => err.push(s),
@@ -226,7 +245,7 @@ describe("runCli error -> exit-code mapping (mapError)", () => {
     };
     const err: string[] = [];
     const code = await runCli(["status", "missing"], {
-      client: client as any,
+      client: fakeAgentRag(client),
       env: { AGENTRAG_HOME: FIXTURE_HOME },
       stdout: sink,
       stderr: (s) => err.push(s),
@@ -242,7 +261,7 @@ describe("runCli error -> exit-code mapping (mapError)", () => {
       }),
     };
     const code = await runCli(["status", "my-docs"], {
-      client: client as any,
+      client: fakeAgentRag(client),
       env: { AGENTRAG_HOME: FIXTURE_HOME },
       stdout: sink,
       stderr: sink,
@@ -258,7 +277,7 @@ describe("runCli error -> exit-code mapping (mapError)", () => {
     };
     const err: string[] = [];
     const code = await runCli(["status", "my-docs"], {
-      client: client as any,
+      client: fakeAgentRag(client),
       env: { AGENTRAG_HOME: FIXTURE_HOME },
       stdout: sink,
       stderr: (s) => err.push(s),
@@ -275,7 +294,7 @@ describe("runCli error -> exit-code mapping (mapError)", () => {
     };
     const err: string[] = [];
     const code = await runCli(["status", "my-docs"], {
-      client: client as any,
+      client: fakeAgentRag(client),
       env: { AGENTRAG_HOME: FIXTURE_HOME },
       stdout: sink,
       stderr: (s) => err.push(s),
@@ -286,11 +305,24 @@ describe("runCli error -> exit-code mapping (mapError)", () => {
 });
 
 describe("runCli dispatches every verb through resolveConfig -> client construction", () => {
+  // Every fixture below returns a COMPLETE, real-shaped result (AskResult/IngestResult/
+  // ExtendResult/CollectionStatus/{deleted:true}) rather than a minimal partial object.
+  // fakeAgentRag's methods are typed against the ACTUAL AgentRag return types (not `as any`),
+  // so tsc itself now rejects an incomplete fixture — it already caught these five being
+  // under-specified once the `as any` erasure was removed.
   it("ask", async () => {
-    const client = { ask: vi.fn(async () => ({ matched: true })) };
+    const client = {
+      ask: vi.fn(async () => ({
+        collection: "docs",
+        expires_at: "2027-01-01T00:00:00.000Z",
+        matched: true,
+        chunks: [],
+        settledTxHash: "",
+      })),
+    };
     const out: string[] = [];
     const code = await runCli(["ask", "what is x?", "--collection", "docs"], {
-      client: client as any,
+      client: fakeAgentRag(client),
       env: { AGENTRAG_HOME: FIXTURE_HOME },
       stdout: (s) => out.push(s),
       stderr: sink,
@@ -304,10 +336,20 @@ describe("runCli dispatches every verb through resolveConfig -> client construct
   });
 
   it("ingest", async () => {
-    const client = { ingest: vi.fn(async () => ({ status: "complete" })) };
+    const client = {
+      ingest: vi.fn(async () => ({
+        collection: "docs",
+        status: "complete",
+        pages_total: 1,
+        pages_failed: 0,
+        chunks: 3,
+        expires_at: "2027-01-01T00:00:00.000Z",
+        settledTxHash: "",
+      })),
+    };
     const out: string[] = [];
     const code = await runCli(["ingest", "--sources", "https://ex.com/**"], {
-      client: client as any,
+      client: fakeAgentRag(client),
       env: { AGENTRAG_HOME: FIXTURE_HOME },
       stdout: (s) => out.push(s),
       stderr: sink,
@@ -319,10 +361,16 @@ describe("runCli dispatches every verb through resolveConfig -> client construct
   });
 
   it("extend", async () => {
-    const client = { extend: vi.fn(async () => ({ collection: "my-docs" })) };
+    const client = {
+      extend: vi.fn(async () => ({
+        collection: "my-docs",
+        expires_at: "2027-04-01T00:00:00.000Z",
+        settledTxHash: "",
+      })),
+    };
     const out: string[] = [];
     const code = await runCli(["extend", "my-docs", "--days", "30"], {
-      client: client as any,
+      client: fakeAgentRag(client),
       env: { AGENTRAG_HOME: FIXTURE_HOME },
       stdout: (s) => out.push(s),
       stderr: sink,
@@ -332,10 +380,19 @@ describe("runCli dispatches every verb through resolveConfig -> client construct
   });
 
   it("status", async () => {
-    const client = { status: vi.fn(async () => ({ collection: "my-docs" })) };
+    const client = {
+      status: vi.fn(async () => ({
+        collection: "my-docs",
+        model: "@cf/baai/bge-m3",
+        pages: 1,
+        chunks: 3,
+        created_at: "2026-01-01T00:00:00.000Z",
+        expires_at: "2027-01-01T00:00:00.000Z",
+      })),
+    };
     const out: string[] = [];
     const code = await runCli(["status", "my-docs"], {
-      client: client as any,
+      client: fakeAgentRag(client),
       env: { AGENTRAG_HOME: FIXTURE_HOME },
       stdout: (s) => out.push(s),
       stderr: sink,
@@ -345,10 +402,10 @@ describe("runCli dispatches every verb through resolveConfig -> client construct
   });
 
   it("delete", async () => {
-    const client = { delete: vi.fn(async () => ({ deleted: true })) };
+    const client = { delete: vi.fn(async () => ({ deleted: true as const })) };
     const out: string[] = [];
     const code = await runCli(["delete", "my-docs"], {
-      client: client as any,
+      client: fakeAgentRag(client),
       env: { AGENTRAG_HOME: FIXTURE_HOME },
       stdout: (s) => out.push(s),
       stderr: sink,
@@ -401,6 +458,76 @@ describe("runCli secret safety", () => {
       expect(code).not.toBe(EXIT.OK);
       expect([...out, ...err].join("")).not.toContain(SENTINEL);
     } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  // Review Important: the two tests above only prove the sentinel is safe when it arrives via
+  // the INJECTED `deps.env` object. In production, `deps.env` IS `process.env`
+  // (cli.ts: `const env = deps.env ?? process.env`) — a leak written the way a real one would
+  // be (a debug dump, a serialized config, an error handler that includes the environment)
+  // reads the AMBIENT object and is invisible to a test that only ever populates `deps.env`.
+  // Demonstrated by the review: adding `env: process.env` to printError's JSON envelope left
+  // all 105 tests green while the real built binary printed the key to stderr. These two put
+  // the sentinel in the REAL process.env and call runCli with NO env dep, so cli.ts's own
+  // `?? process.env` fallback is what's actually exercised.
+  it("a REAL ambient process.env AGENTRAG_PRIVATE_KEY never leaks (no injected env dep)", async () => {
+    const SENTINEL = "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+    const home = mkdtempSync(join(tmpdir(), "agentrag-cli-ambient-"));
+    const saved = {
+      AGENTRAG_HOME: process.env.AGENTRAG_HOME,
+      AGENTRAG_PRIVATE_KEY: process.env.AGENTRAG_PRIVATE_KEY,
+      AGENTRAG_MAX_SPEND_USD: process.env.AGENTRAG_MAX_SPEND_USD,
+    };
+    const out: string[] = [];
+    const err: string[] = [];
+    try {
+      process.env.AGENTRAG_HOME = home;
+      process.env.AGENTRAG_PRIVATE_KEY = SENTINEL;
+      // Fail-closed before any client is built, same reason as the injected-env version.
+      process.env.AGENTRAG_MAX_SPEND_USD = "not-a-number";
+      const code = await runCli(["status", "my-docs"], {
+        // Deliberately NO `env` — forces cli.ts's `deps.env ?? process.env` fallback to read
+        // the REAL ambient environment just set above, exactly as a genuine invocation would.
+        stdout: (s) => out.push(s),
+        stderr: (s) => err.push(s),
+      });
+      expect(code).not.toBe(EXIT.OK);
+      expect([...out, ...err].join("")).not.toContain(SENTINEL);
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("a REAL ambient process.env AGENTRAG_ACCOUNT_KEY never leaks (no injected env dep)", async () => {
+    const SENTINEL = `ak_${"9".repeat(64)}`;
+    const home = mkdtempSync(join(tmpdir(), "agentrag-cli-ak-ambient-"));
+    const saved = {
+      AGENTRAG_HOME: process.env.AGENTRAG_HOME,
+      AGENTRAG_ACCOUNT_KEY: process.env.AGENTRAG_ACCOUNT_KEY,
+      AGENTRAG_MAX_SPEND_USD: process.env.AGENTRAG_MAX_SPEND_USD,
+    };
+    const out: string[] = [];
+    const err: string[] = [];
+    try {
+      process.env.AGENTRAG_HOME = home;
+      process.env.AGENTRAG_ACCOUNT_KEY = SENTINEL;
+      process.env.AGENTRAG_MAX_SPEND_USD = "not-a-number";
+      const code = await runCli(["status", "my-docs"], {
+        stdout: (s) => out.push(s),
+        stderr: (s) => err.push(s),
+      });
+      expect(code).not.toBe(EXIT.OK);
+      expect([...out, ...err].join("")).not.toContain(SENTINEL);
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
       rmSync(home, { recursive: true, force: true });
     }
   });

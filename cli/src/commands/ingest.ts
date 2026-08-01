@@ -1,9 +1,11 @@
 import { readFileSync } from "node:fs";
 import type { IngestDocument, IngestOptions } from "@agentrag/client";
-import { parseFlags, UsageError } from "../args";
+import { INGEST_FLAGS, parseFlags, UsageError } from "../args";
 import { EXIT, printError, printJson, type Writer } from "../output";
 
-type IngestClient = {
+// Exported so tests can type a fake client against the exact shape the real AgentRag must
+// satisfy, instead of erasing the seam with `as never`/`as any`.
+export type IngestClient = {
   ingest: (o: IngestOptions) => Promise<unknown>;
 };
 
@@ -39,7 +41,7 @@ export async function runIngest(
   args: string[],
   io: { client: IngestClient; stdout: Writer; stderr: Writer },
 ): Promise<number> {
-  const { flags } = parseFlags(args);
+  const { flags } = parseFlags(args, INGEST_FLAGS);
   const f = flags as {
     sources?: string[];
     documents?: string;

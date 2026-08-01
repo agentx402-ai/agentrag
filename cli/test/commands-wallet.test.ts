@@ -129,6 +129,20 @@ describe("wallet show", () => {
     writeKeystore("wallet.json", { address: ADDRESS, privateKey: "nope" });
     expect(() => show()).toThrow(/missing or malformed privateKey/);
   });
+
+  // Review Minor: "wallet show and the paying path disagree on a 0X-prefixed key." viem's
+  // privateKeyToAccount (used by both clientFromConfig and resolveWalletIdentity itself) accepts
+  // an uppercase 0X prefix — verified directly against viem — but the old KEY_RE was
+  // lowercase-only, so `wallet show` rejected a key that every real op accepted. Case-
+  // insensitivity on the prefix closes that gap.
+  it("accepts a 0X-prefixed (uppercase) AGENTRAG_PRIVATE_KEY, matching what clientFromConfig accepts", () => {
+    const upper = `0X${"3".repeat(64)}`;
+    const r = show(["show"], { AGENTRAG_PRIVATE_KEY: upper });
+    expect(r.code).toBe(EXIT.OK);
+    const j = JSON.parse(r.out);
+    expect(j.source).toBe("env");
+    expect(j.address).toBe(privateKeyToAccount(upper as `0x${string}`).address);
+  });
 });
 
 describe("wallet usage", () => {
@@ -142,5 +156,17 @@ describe("wallet usage", () => {
 
   it("rejects an unknown flag rather than ignoring it", () => {
     expect(() => show(["show", "--frobnicate", "1"])).toThrow(/unknown flag/);
+  });
+
+  // Review Minor: "every command accepts every other command's flags and silently drops them."
+  // WALLET_FLAGS is empty — `wallet show` takes no flags at all, not even a globally-known one
+  // like --days (extend's) or --endpoint (a global config flag wallet never reads).
+  it("rejects a globally-known flag too, not just typos (e.g. --days, --endpoint)", () => {
+    expect(() => show(["show", "--days", "30"])).toThrow(
+      /flag --days is not valid for this command/,
+    );
+    expect(() => show(["show", "--endpoint", "https://x.example"])).toThrow(
+      /flag --endpoint is not valid for this command/,
+    );
   });
 });

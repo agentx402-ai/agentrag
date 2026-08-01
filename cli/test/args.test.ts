@@ -1,5 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { parseFlags, UsageError } from "../src/args";
+import {
+  ASK_FLAGS,
+  DELETE_FLAGS,
+  EXTEND_FLAGS,
+  GLOBAL_FLAGS,
+  INGEST_FLAGS,
+  parseFlags,
+  STATUS_FLAGS,
+  UsageError,
+  WALLET_FLAGS,
+} from "../src/args";
 
 describe("parseFlags", () => {
   it("collects positionals and camelCases known flags", () => {
@@ -67,5 +77,84 @@ describe("parseFlags", () => {
     expect(() => parseFlags(["--json"])).toThrow(/unknown flag --json/);
     expect(() => parseFlags(["--pretty"])).toThrow(/unknown flag --pretty/);
     expect(() => parseFlags(["--reveal"])).toThrow(/unknown flag --reveal/);
+  });
+
+  // Review Important: "no test asserts a secret cannot be supplied as a flag." The config half
+  // (secrets never read from config.json) was already guarded; this pins the flag half. Fails
+  // today because neither name is in KNOWN_FLAGS — would catch a well-meaning "convenience
+  // flag" PR that wired one in, exactly as the review demonstrated by adding one and watching
+  // all 105 tests stay green.
+  it("rejects --private-key and --account-key as flags (secrets are env-only, never a CLI flag)", () => {
+    expect(() => parseFlags(["--private-key", "0xabc"])).toThrow(/unknown flag --private-key/);
+    expect(() => parseFlags(["--account-key", "ak_abc"])).toThrow(/unknown flag --account-key/);
+  });
+});
+
+describe("parseFlags with a per-command allowlist (the `allowed` param)", () => {
+  it("rejects a globally-known flag that isn't in the allowed set", () => {
+    // "days" is a real, KNOWN_FLAGS-listed flag (extend's) — this proves the allowlist rejects
+    // it for a command that didn't ask for it, not merely typos outside KNOWN_FLAGS entirely.
+    expect(() => parseFlags(["--days", "30"], new Set(["sources"]))).toThrow(
+      /flag --days is not valid for this command/,
+    );
+  });
+
+  it("still accepts a flag that IS in the allowed set", () => {
+    const { flags } = parseFlags(["--days", "30"], new Set(["days"]));
+    expect(flags.days).toBe(30);
+  });
+
+  it("with no allowed set given (cli.ts's own top-level parse), falls back to the full KNOWN_FLAGS", () => {
+    const { flags } = parseFlags(["--days", "30"]); // no second argument at all
+    expect(flags.days).toBe(30);
+  });
+});
+
+// Review Minor: "every command accepts every other command's flags and silently drops them"
+// (e.g. `agentrag ask q --refresh` used to parse clean and do nothing — a billing-relevant
+// surprise, since AskOptions has no refresh wiring in ask.ts). These pin the exported
+// allowlists themselves; commands-*.test.ts pins the resulting command-level BEHAVIOR.
+describe("per-command flag allowlists", () => {
+  it("GLOBAL_FLAGS is exactly the four config flags", () => {
+    expect([...GLOBAL_FLAGS].sort()).toEqual(
+      ["endpoint", "max-session-spend-usd", "max-spend-usd", "network"].sort(),
+    );
+  });
+
+  it("ASK_FLAGS: the ask surface plus GLOBAL_FLAGS, and nothing extend/ingest-only", () => {
+    for (const f of ["sources", "collection", "top-k", "mode", "max-pages", "wait", "endpoint"]) {
+      expect(ASK_FLAGS.has(f)).toBe(true);
+    }
+    expect(ASK_FLAGS.has("refresh")).toBe(false); // ingest-only
+    expect(ASK_FLAGS.has("documents")).toBe(false); // ingest-only
+    expect(ASK_FLAGS.has("model")).toBe(false); // ingest-only
+    expect(ASK_FLAGS.has("days")).toBe(false); // extend-only
+  });
+
+  it("INGEST_FLAGS: the ingest surface plus GLOBAL_FLAGS, and nothing ask/extend-only", () => {
+    for (const f of ["sources", "documents", "collection", "model", "max-pages", "refresh"]) {
+      expect(INGEST_FLAGS.has(f)).toBe(true);
+    }
+    expect(INGEST_FLAGS.has("wait")).toBe(false); // ask-only
+    expect(INGEST_FLAGS.has("top-k")).toBe(false); // ask-only
+    expect(INGEST_FLAGS.has("mode")).toBe(false); // ask-only
+    expect(INGEST_FLAGS.has("days")).toBe(false); // extend-only
+  });
+
+  it("EXTEND_FLAGS: only --days plus GLOBAL_FLAGS", () => {
+    expect(EXTEND_FLAGS.has("days")).toBe(true);
+    for (const f of ["sources", "collection", "documents", "model", "wait", "refresh"]) {
+      expect(EXTEND_FLAGS.has(f)).toBe(false);
+    }
+  });
+
+  it("STATUS_FLAGS and DELETE_FLAGS accept only the global config flags, no verb-specific ones", () => {
+    for (const flags of [STATUS_FLAGS, DELETE_FLAGS]) {
+      expect([...flags].sort()).toEqual([...GLOBAL_FLAGS].sort());
+    }
+  });
+
+  it("WALLET_FLAGS accepts nothing, not even the global config flags (wallet never calls resolveConfig)", () => {
+    expect(WALLET_FLAGS.size).toBe(0);
   });
 });

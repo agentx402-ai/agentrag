@@ -1,8 +1,10 @@
 import type { AskOptions } from "@agentrag/client";
-import { parseFlags } from "../args";
+import { ASK_FLAGS, parseFlags } from "../args";
 import { EXIT, printError, printJson, type Writer } from "../output";
 
-type AskClient = {
+// Exported so tests can type a fake client against the exact shape the real AgentRag must
+// satisfy, instead of erasing the seam with `as never`/`as any`.
+export type AskClient = {
   ask: (query: string, o?: AskOptions) => Promise<unknown>;
   askAndWait: (query: string, o?: AskOptions) => Promise<unknown>;
 };
@@ -11,7 +13,7 @@ export async function runAsk(
   args: string[],
   io: { client: AskClient; stdout: Writer; stderr: Writer },
 ): Promise<number> {
-  const { flags, positionals } = parseFlags(args);
+  const { flags, positionals } = parseFlags(args, ASK_FLAGS);
   const query = positionals[0];
   if (!query) {
     printError(io.stderr, "usage", "ask requires <query>");
