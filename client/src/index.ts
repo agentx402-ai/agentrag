@@ -9,11 +9,23 @@ import { isAccountKeyFormat } from "./account";
 import { AgentRagError, ragErrorFromResponse, SpendCapError } from "./errors";
 import {
   buildBearerHeaders,
+  buildIdentityHeaders,
   buildPaymentHeader,
   challengePriceUsd,
+  creditsRemaining,
+  freshNonce,
   nonceFromIdempotencyKey,
+  settledTxHash,
 } from "./payment";
-import type { AgentRagOptions, RagModelId, Signer } from "./types";
+import { askAuthorizedCeilingUsd } from "./pricing";
+import type {
+  AgentRagOptions,
+  AskOptions,
+  AskPending,
+  AskResult,
+  RagModelId,
+  Signer,
+} from "./types";
 
 export { generateAccountKey, isAccountKeyFormat } from "./account";
 export {
@@ -24,6 +36,7 @@ export {
   SpendCapError,
 } from "./errors";
 export * from "./types";
+export * from "./usage";
 
 // Compiled into the published bundle and reported to the service; kept in lockstep with
 // package.json's version by the `versions` CI job (version-lockstep source 3 of 6).
@@ -58,7 +71,21 @@ export const MAX_DOCUMENTS = 100;
 // would have accepted, so the two must agree to the byte.
 export const MAX_DOCUMENT_BYTES = 100 * 1024;
 
+// askAndWait defaults. `DEFAULT_ASK_POLL_INTERVAL_MS` is a fallback only — ordinarily the
+// wait between polls is governed by the 202's own `retry_after` (see askAndWait's doc
+// comment), not this constant.
+/** Overall polling budget before `askAndWait` throws `ingest_timeout`, absent an explicit `maxWaitMs`. */
+export const DEFAULT_ASK_WAIT_MS = 120_000;
+/** Fallback delay between polls, used only when both `pollIntervalMs` and the 202's `retry_after` are absent/non-positive. */
+export const DEFAULT_ASK_POLL_INTERVAL_MS = 15_000;
+
 const DEFAULT_NETWORK = "eip155:8453";
+// Mirrors the worker's own `mode` enum (routes/ask.ts's parseAskBody).
+const ASK_MODES = ["hybrid", "dense", "bm25"] as const;
+// Mirrors the worker's own `max_pages` default (routes/ask.ts's parseAskBody) — used ONLY
+// to size the authorized-ceiling formula when the caller omits `maxPages`; the wire
+// request itself omits `max_pages` too in that case, so the worker applies this same default.
+const DEFAULT_ASK_MAX_PAGES = 20;
 
 /**
  * Fail closed on a malformed money bound. A spend cap that is not a finite, non-negative
@@ -78,6 +105,51 @@ function assertFiniteUsd(value: unknown, label: string): void {
     // misses. `e.code` is unchanged either way.
     throw new AgentRagError((e as Error).message, "invalid_config", 0);
   }
+}
+
+/**
+ * Mirrors the worker's own source-grammar validation (ingest/sources.ts's `resolveOne`) so
+ * a malformed source is rejected client-side before any request: an exact http(s) URL, or
+ * a URL whose path ends with the literal trailing segment "/**" (a same-origin crawl
+ * root). "**" is grammar ONLY as a whole trailing segment — anywhere else is rejected with
+ * a precise reason instead of a generic parse failure.
+ */
+function assertValidSource(entry: string): void {
+  const isCrawl = entry.endsWith("/**");
+  if (!isCrawl && entry.includes("**")) {
+    throw new AgentRagError(
+      `invalid source ${JSON.stringify(entry)}: "**" is only valid as a trailing path segment ("/**")`,
+      "invalid_request",
+      0,
+    );
+  }
+  const candidate = isCrawl ? entry.slice(0, -2) : entry; // strip trailing "**", keep the "/"
+  let parsed: URL;
+  try {
+    parsed = new URL(candidate);
+  } catch {
+    throw new AgentRagError(
+      `invalid source ${JSON.stringify(entry)}: not a valid URL`,
+      "invalid_request",
+      0,
+    );
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new AgentRagError(
+      `invalid source ${JSON.stringify(entry)}: unsupported URL scheme "${parsed.protocol}"`,
+      "invalid_request",
+      0,
+    );
+  }
+}
+
+/** Type guard distinguishing a 202 (`AskPending`) from a settled `AskResult`. */
+function isAskPending(result: AskResult | AskPending): result is AskPending {
+  return (result as AskPending).status === "ingesting";
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 export class AgentRag {
@@ -387,5 +459,205 @@ export class AgentRag {
       );
     }
     return this.signer;
+  }
+
+  /**
+   * Ask a question over a collection, ingesting `sources` on demand when the target
+   * collection doesn't exist yet (or `refresh` is set). Paid per call: the flat
+   * `ASK_BASE_USD` when no ingest is needed, or a composite ingest-denominated charge
+   * (spec §11.3) when `sources` triggers one — `askAuthorizedCeilingUsd` computes the
+   * ceiling this SDK authorizes from its OWN pinned prices, BEFORE the 402 challenge is
+   * even read, so an inflated or spoofed quote is refused pre-signature (see performOp).
+   *
+   * A 202 (the collection is still being ingested) resolves as `AskPending` — NOT an
+   * error. Use `askAndWait` to block until it resolves, or poll `status()` (a later
+   * task's public surface) yourself.
+   */
+  async ask(query: string, opts: AskOptions = {}): Promise<AskResult | AskPending> {
+    if (typeof query !== "string" || query.trim().length === 0) {
+      throw new AgentRagError(
+        "query is required and must be a non-empty string",
+        "invalid_request",
+        0,
+      );
+    }
+    if (query.length > MAX_QUERY_CHARS) {
+      throw new AgentRagError(
+        `query must be ${MAX_QUERY_CHARS} characters or less (got ${query.length})`,
+        "invalid_request",
+        0,
+      );
+    }
+    if (opts.topK !== undefined) {
+      if (!Number.isInteger(opts.topK) || opts.topK < 1 || opts.topK > MAX_TOP_K) {
+        throw new AgentRagError(
+          `topK must be an integer between 1 and ${MAX_TOP_K} (got ${opts.topK})`,
+          "invalid_request",
+          0,
+        );
+      }
+    }
+    if (opts.mode !== undefined && !ASK_MODES.includes(opts.mode)) {
+      throw new AgentRagError(
+        `mode must be one of ${ASK_MODES.join(", ")} (got ${JSON.stringify(opts.mode)})`,
+        "invalid_request",
+        0,
+      );
+    }
+    if (opts.maxPages !== undefined) {
+      if (
+        !Number.isInteger(opts.maxPages) ||
+        opts.maxPages < 1 ||
+        opts.maxPages > MAX_PAGES_PER_CALL
+      ) {
+        throw new AgentRagError(
+          `maxPages must be an integer between 1 and ${MAX_PAGES_PER_CALL} (got ${opts.maxPages})`,
+          "invalid_request",
+          0,
+        );
+      }
+    }
+    if (opts.sources !== undefined) {
+      for (const source of opts.sources) assertValidSource(source);
+    }
+    if (opts.sources === undefined && opts.collection === undefined) {
+      throw new AgentRagError(
+        "at least one of sources or collection is required",
+        "invalid_request",
+        0,
+      );
+    }
+
+    const body: Record<string, unknown> = { query };
+    if (opts.sources !== undefined) body.sources = opts.sources;
+    if (opts.collection !== undefined) body.collection = opts.collection;
+    if (opts.topK !== undefined) body.top_k = opts.topK;
+    if (opts.mode !== undefined) body.mode = opts.mode;
+    if (opts.maxPages !== undefined) body.max_pages = opts.maxPages;
+    if (opts.refresh !== undefined) body.refresh = opts.refresh;
+
+    const effectiveMaxPages = opts.maxPages ?? DEFAULT_ASK_MAX_PAGES;
+
+    return this.performOp<AskResult | AskPending>({
+      method: "POST",
+      path: "/v1/rag/ask",
+      url: `${this.endpoint}/v1/rag/ask`,
+      idempotencyKey: opts.idempotencyKey ?? freshNonce(),
+      label: "ask failed",
+      authorizedCeilingUsd: askAuthorizedCeilingUsd(opts.sources, effectiveMaxPages),
+      buildRequest: (headers) => ({
+        method: "POST",
+        headers: { "content-type": "application/json", ...headers },
+        body: JSON.stringify(body),
+      }),
+      parseSuccess: async (res) => {
+        const parsed = JSON.parse(await res.text()) as AskResult | AskPending;
+        return {
+          ...parsed,
+          settledTxHash: settledTxHash(res),
+          creditsRemaining: creditsRemaining(res),
+        };
+      },
+    });
+  }
+
+  /**
+   * `ask`, but transparently waits out a 202 instead of returning `AskPending`: polls
+   * this collection's ingest-job state until it leaves `running`, then re-asks against
+   * the now-resolved collection directly — dropping `sources`/`maxPages`/`refresh` on
+   * the retry, since re-sending them would re-quote (and, in wallet mode, re-sign) a
+   * full composite ingest charge for work that is already done. A fresh idempotency key
+   * is used for the retry too (never the original ask's), since it is a structurally
+   * different request body — reusing the same key risks `idempotency_conflict`.
+   *
+   * Throws `ingest_timeout` at `maxWaitMs` (default `DEFAULT_ASK_WAIT_MS`); the job
+   * itself keeps running server-side regardless — a timeout here loses patience, not the
+   * ingest. `pollIntervalMs`, when omitted, defaults to the 202's own `retry_after`
+   * (falling back to `DEFAULT_ASK_POLL_INTERVAL_MS` if that is missing or non-positive).
+   *
+   * Polling here goes through a MINIMAL internal helper (`pollIngestJobState`) that reads
+   * just the one field this method needs — not the full public `status()` surface
+   * (validation, error mapping, `CollectionStatus` parsing), which is a later task's job.
+   */
+  async askAndWait(
+    query: string,
+    opts: AskOptions & { maxWaitMs?: number; pollIntervalMs?: number } = {},
+  ): Promise<AskResult> {
+    const { maxWaitMs, pollIntervalMs, ...askOpts } = opts;
+    const deadline = Date.now() + (maxWaitMs ?? DEFAULT_ASK_WAIT_MS);
+
+    let result = await this.ask(query, askOpts);
+    while (isAskPending(result)) {
+      const { collection } = result;
+      const serverIntervalMs =
+        Number.isFinite(result.retry_after) && result.retry_after > 0
+          ? result.retry_after * 1000
+          : DEFAULT_ASK_POLL_INTERVAL_MS;
+      const interval = Math.max(0, pollIntervalMs ?? serverIntervalMs);
+
+      for (;;) {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) {
+          throw new AgentRagError(
+            `ask on collection "${collection}" did not finish ingesting within maxWaitMs; ` +
+              "it may still complete server-side",
+            "ingest_timeout",
+            0,
+          );
+        }
+        await sleep(Math.min(interval, remaining));
+        const state = await this.pollIngestJobState(collection);
+        if (state !== "running") break;
+      }
+
+      // Ingest is no longer running (complete or failed) -> re-ask the resolved
+      // collection directly. Only retrieval knobs carry over; sources/maxPages/refresh
+      // are ingest-only and idempotencyKey must be fresh (see doc comment above).
+      result = await this.ask(query, {
+        collection,
+        topK: askOpts.topK,
+        mode: askOpts.mode,
+      });
+    }
+    return result;
+  }
+
+  /**
+   * Minimal internal poll of a collection's ingest-job state, used ONLY by `askAndWait`.
+   * `GET /v1/rag/collection/:id` is a FREE, identity-signed (or bearer, in account-key
+   * mode) route — never x402 — so this bypasses `performOp` (built for the paid dance)
+   * entirely. Returns `undefined` when the response carries no `job` block (nothing ever
+   * ran there), which `askAndWait` treats the same as a terminal state (not "running").
+   *
+   * NOT the public `status()` surface — that is a later task's job (full
+   * `CollectionStatus` parsing, error mapping, public API). This helper reads only the
+   * one field `askAndWait` needs; feel free to replace it with a call through the real
+   * `status()` once that lands.
+   */
+  protected async pollIngestJobState(
+    collection: string,
+  ): Promise<"running" | "complete" | "failed" | undefined> {
+    const path = `/v1/rag/collection/${encodeURIComponent(collection)}`;
+    // Spread into a fresh object literal so both branches unify on plain
+    // Record<string, string> (IdentityHeaders has no index signature of its own).
+    const headers: Record<string, string> = this.accountKey
+      ? buildBearerHeaders(this.accountKey)
+      : {
+          ...(await buildIdentityHeaders(this.requireSigner(), {
+            method: "GET",
+            path,
+            host: new URL(this.endpoint).host,
+            network: this.network,
+          })),
+        };
+    const res = await this.fetchWithRetry(`${this.endpoint}${path}`, () => ({
+      method: "GET",
+      headers,
+    }));
+    if (!res.ok) throw await this.asError(res, "collection status failed");
+    const body = (await res.json()) as {
+      job?: { state: "running" | "complete" | "failed" };
+    };
+    return body.job?.state;
   }
 }

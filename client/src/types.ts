@@ -1,6 +1,35 @@
-import type { Signer, UsageBlock } from "@agentx402-ai/core";
+import type { UsageBlock as CoreUsageBlock, Signer } from "@agentx402-ai/core";
 
-export type { Signer, UsageBlock };
+export type { Signer };
+
+// TEMPORARY WORKAROUND (tracked in the task list as "Release core 0.4.0
+// (breakdown/expiring_soon)", owner-gated): the PUBLISHED @agentx402-ai/core@0.3.0
+// predates the commit that added `breakdown`/`expiring_soon` to UsageBlock on core's own
+// main branch — core's package.json was never bumped off 0.3.0, so npm's 0.3.0 lacks
+// fields core's own source already carries. `totalPriceUsd` (usage.ts) needs `breakdown`
+// today, so this SDK carries its own copy of the two fields until core ships 0.4.0 and
+// this package's dependency bumps to match. Every other file in this SDK imports the
+// PUBLIC name `UsageBlock` from "./types" (never `RagUsageBlock` directly), so once core
+// 0.4.0 lands, collapsing this back to a plain `export type { UsageBlock } from
+// "@agentx402-ai/core";` and deleting RagUsageBlock is a one-file diff.
+export interface RagUsageBlock extends CoreUsageBlock {
+  /**
+   * Composite-op itemization: additional charge legs beyond the primary verb (e.g. an
+   * AgentRAG ask that also ingested pages). The top-level `price_usd` is the PRIMARY
+   * verb's price on the taken path; the request's total cost is `price_usd` + the sum of
+   * `breakdown[].price_usd`. Absent on single-leg ops — never an empty array on the wire.
+   * Mirrors core's own (unreleased) UsageBlock.breakdown field-for-field.
+   */
+  breakdown?: Array<{ op: string; units: number; price_usd: number }>;
+  /**
+   * Present (always literal `true`, never `false`) when the collection named by this
+   * response is inside the final 24h of its lifetime — the caller's cue to query it
+   * (sliding the expiry) or extend it. Omitted otherwise. Mirrors core's own (unreleased)
+   * UsageBlock.expiring_soon field-for-field.
+   */
+  expiring_soon?: true;
+}
+export type UsageBlock = RagUsageBlock;
 
 /** Embedding model backing a collection. Fixed at collection creation — an `ingest` against
  * an existing collection with a different model is rejected server-side (model_mismatch). */
@@ -84,6 +113,17 @@ export interface AskResult {
   ingest?: IngestProgress;
   usage?: UsageBlock;
   request_id?: string;
+  /**
+   * On-chain settlement txHash for this op, or `""` when it settled on credits (nothing
+   * moved on-chain) or the worker sent no `PAYMENT-RESPONSE` header. See `settledTxHash()`
+   * in payment.ts — always computed, never fabricated.
+   */
+  settledTxHash: string;
+  /**
+   * Prepaid-credit balance remaining after this op. `undefined` when no real balance was
+   * read this call (never coerced from a genuine 0 — see `creditsRemaining()` in payment.ts).
+   */
+  creditsRemaining?: number;
 }
 
 /** A 202 response: the collection is still being ingested. Not an error — poll `status()` or
@@ -101,6 +141,14 @@ export interface AskPending {
    */
   usage?: UsageBlock;
   request_id?: string;
+  /**
+   * On-chain settlement txHash for a charge ALREADY settled before this 202 (e.g. an
+   * ask's on-demand ingest leg) — `""` when nothing has settled on-chain yet. Mirrors
+   * `AskResult.settledTxHash`; see `settledTxHash()` in payment.ts.
+   */
+  settledTxHash: string;
+  /** Mirrors `AskResult.creditsRemaining`; see `creditsRemaining()` in payment.ts. */
+  creditsRemaining?: number;
 }
 
 export interface IngestDocument {
@@ -129,6 +177,10 @@ export interface IngestResult {
   expires_at: string;
   usage?: UsageBlock;
   request_id?: string;
+  /** Mirrors `AskResult.settledTxHash` — populate from `settledTxHash()` in payment.ts. */
+  settledTxHash: string;
+  /** Mirrors `AskResult.creditsRemaining` — populate from `creditsRemaining()` in payment.ts. */
+  creditsRemaining?: number;
 }
 
 export interface ExtendResult {
@@ -136,6 +188,10 @@ export interface ExtendResult {
   expires_at: string;
   usage?: UsageBlock;
   request_id?: string;
+  /** Mirrors `AskResult.settledTxHash` — populate from `settledTxHash()` in payment.ts. */
+  settledTxHash: string;
+  /** Mirrors `AskResult.creditsRemaining` — populate from `creditsRemaining()` in payment.ts. */
+  creditsRemaining?: number;
 }
 
 /** Returned by the identity-signed, free `status()` op. */
