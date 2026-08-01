@@ -582,7 +582,7 @@ export class AgentRag {
         // own. The shape is already pinned by `env`'s own type assertion above; this
         // cast just carries that same trust through the spread, not a new one.
         return {
-          ...(env as unknown as AskResult),
+          ...env.data,
           usage: env.usage,
           request_id: env.request_id,
           settledTxHash: settledTxHash(res),
@@ -726,6 +726,6 @@ export class AgentRag {
     const body = (await res.json()) as {
       data?: { job?: { state: "running" | "complete" | "failed" } };
     };
-    return (body as unknown as { job?: { state: "running" | "complete" | "failed" } }).job?.state;
+    return body.data?.job?.state;
   }
 }
