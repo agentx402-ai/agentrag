@@ -1,0 +1,39 @@
+{
+  "name": "agentrag",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "description": "Open-source clients for AgentRAG — agent-native, x402-paid retrieval. Ask questions over your own documents; pay per call in USDC, no accounts or API keys.",
+  "author": "The AgentRAG Authors <contact@agentx402.ai>",
+  "homepage": "https://github.com/agentx402-ai/agentrag#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/agentx402-ai/agentrag.git"
+  },
+  "bugs": {
+    "url": "https://github.com/agentx402-ai/agentrag/issues"
+  },
+  "workspaces": [
+    "client",
+    "cli"
+  ],
+  "scripts": {
+    "prepare": "git config core.hooksPath .githooks || true",
+    "build": "npm --workspace client run build && npm --workspace cli run build",
+    "typecheck": "npm --workspace client run typecheck && npm --workspace cli run typecheck",
+    "pretest": "npm --workspace client run build",
+    "test": "npm --workspace client test && npm --workspace cli test",
+    "pretest:coverage": "npm --workspace client run build",
+    "test:coverage": "npm --workspace client run test:coverage && npm --workspace cli run test:coverage",
+    "lint": "biome ci .",
+    "format": "biome check --write ."
+  },
+  "overrides": {
+    "ws": "^8.21.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.6",
+    "@vitest/coverage-v8": "^4.1.9"
+  }
+}

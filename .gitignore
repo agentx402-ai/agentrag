@@ -1,0 +1,42 @@
+# Dependencies
+node_modules/
+.pnp/
+.pnp.js
+
+# Build output
+dist/
+build/
+*.tsbuildinfo
+
+# Test / coverage
+coverage/
+.vitest/
+
+# Secrets / local env — never commit
+.env
+.env.*
+!.env.example
+.dev.vars
+
+# Generated (graphify knowledge graph): regenerable via `graphify update .`.
+# Kept out of this public repo; regenerate locally as needed.
+graphify-out
+
+# Local code-review scratch (workflow output + report)
+.review/
+
+# spec-driven-development scratch (briefs/reports live in the executive/ archive)
+.superpowers/
+
+# Local dev tooling / pack artifacts
+.impeccable/
+.agents/
+.claude/
+skills-lock.json
+docs/
+*.tgz
+
+# editor / OS
+.DS_Store
+*.log
+npm-debug.log*
