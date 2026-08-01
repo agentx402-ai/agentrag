@@ -22,6 +22,7 @@ import {
   askAuthorizedCeilingUsd,
   extendAuthorizedCeilingUsd,
   ingestAuthorizedCeilingUsd,
+  usdToAtomic,
 } from "./pricing";
 import type {
   AgentRagOptions,
@@ -491,9 +492,12 @@ export class AgentRag {
    * mode issues exactly ONE bearer-authenticated request — no probe, no 402, no signing.
    * Wallet mode: bare probe -> on 402, price the challenge and run every guard BEFORE
    * signing (the caller's authorized ceiling, or the DEFAULT_MAX_OP_USD backstop when an
-   * op declares none; then a SYNCHRONOUS spend-cap reservation) -> sign the challenge
-   * VERBATIM (buildPaymentHeader pins expectedNetwork + canonical USDC + expectedPayTo,
-   * and refuses a payTo mismatch BEFORE signing) -> retry the SAME url with the SAME
+   * op declares none; then a SYNCHRONOUS spend-cap reservation) -> sign the challenge's
+   * amount (buildPaymentHeader pins expectedNetwork + canonical USDC + expectedPayTo, and
+   * refuses a payTo mismatch BEFORE signing) — UNLESS the caller supplied `pinnedAmountUsd`
+   * (extend()'s case: a top-up-style route whose pre-auth quote is deliberately not the
+   * real price), in which case that pinned amount is signed instead, via
+   * buildPaymentHeader's own `amountAtomic` override — -> retry the SAME url with the SAME
    * Idempotency-Key plus PAYMENT-SIGNATURE.
    */
   protected async performOp<T>(spec: {
@@ -508,6 +512,16 @@ export class AgentRag {
     // Undefined means the op declares no ceiling of its own, falling back to the
     // DEFAULT_MAX_OP_USD backstop (assertOpPriceCeiling) below.
     authorizedCeilingUsd?: number;
+    // When set, this op signs EXACTLY this USD amount (converted to atomic via
+    // buildPaymentHeader's `amountAtomic` override) instead of the 402 challenge's own
+    // quoted amount — for a route whose pre-auth quote is DELIBERATELY not the real price
+    // (extend()'s stateless-quote-to-avoid-a-size-oracle design; see its own doc comment).
+    // The challenge is still required and still supplies network/asset/payTo/domain (the
+    // template `buildPaymentHeader` signs against); only its AMOUNT field is ignored. Every
+    // guard below (the ceiling check, the spend-cap reservation) runs against THIS value,
+    // not the challenge's, so a caller-configured maxSpendUsd/maxSessionSpendUsd still
+    // binds a pinned amount exactly as it would an ordinary quoted one.
+    pinnedAmountUsd?: number;
     buildRequest: (headers: Record<string, string>) => RequestInit;
     parseSuccess: (res: Response) => Promise<T>;
   }): Promise<T> {
@@ -531,13 +545,15 @@ export class AgentRag {
       spec.buildRequest({ "Idempotency-Key": idempotencyKey }),
     );
 
-    // 2) 402 -> pay the exact quoted amount and retry once (same key => exactly-once).
+    // 2) 402 -> pay the exact quoted amount (or the caller's pinned one — see
+    // pinnedAmountUsd above) and retry once (same key => exactly-once).
     if (res.status === 402) {
       const challenge = res.headers.get("PAYMENT-REQUIRED");
       if (!challenge) {
         throw await this.asError(res, "payment required but no PAYMENT-REQUIRED challenge");
       }
-      const usd = challengePriceUsd(challenge, undefined, this.network);
+      const challengeUsd = challengePriceUsd(challenge, undefined, this.network);
+      const usd = spec.pinnedAmountUsd ?? challengeUsd;
       // Money-safety: every guard below runs BEFORE any signature is produced.
       if (spec.authorizedCeilingUsd !== undefined) {
         // Defense in depth at the signing choke point: a non-finite ceiling (a NaN that
@@ -572,6 +588,9 @@ export class AgentRag {
           expectedNetwork: this.network,
           expectedPayTo: this.expectedPayTo,
           nonce: nonceFromIdempotencyKey(idempotencyKey),
+          ...(spec.pinnedAmountUsd !== undefined
+            ? { amountAtomic: usdToAtomic(spec.pinnedAmountUsd) }
+            : {}),
         });
         res = await this.fetchWithRetry(url, () =>
           spec.buildRequest({
@@ -947,25 +966,27 @@ export class AgentRag {
    * Push a named collection's `expires_at` out by `days` (30/60/90). Paid per call:
    * `max(1, ceil(chunks / CHUNKS_PER_BLOCK))` blocks (capped by the service's own
    * MAX_CHUNKS at 5 blocks) times `days / 30`, at the per-block extend price — priced on
-   * the collection's REAL chunk count, not a flat rate independent of size (a prior version
-   * of this comment claimed the latter, incorrectly).
+   * the collection's REAL chunk count, not a flat rate independent of size.
    *
-   * **Wallet mode has a real limit this method actively guards.** The worker's pre-auth 402
-   * challenge for extend is deliberately stateless — it always quotes the 1-block basis, so
-   * an unauthenticated probe can never be used to learn a collection's real size — and a
-   * signed x402 authorization can never exceed what the challenge quoted (`performOp` signs
-   * the challenge verbatim, never a self-computed sum). A collection needing MORE than one
-   * block therefore cannot be extended via a single wallet-mode call, structurally, no
-   * matter what ceiling this method computes: the post-auth settle would demand more than
-   * was signed and fail closed. To avoid burning a real signature on a call that is
-   * provably doomed, this method calls the free, owner-gated `status()` first to learn the
-   * real chunk count, and refuses BEFORE any signature (`extend_too_large_for_wallet_mode`)
-   * when more than one block is needed.
+   * **Wallet mode signs the REAL computed amount, not the challenge's quote.** The worker's
+   * pre-auth 402 challenge for extend is deliberately stateless — it always quotes the
+   * 1-block basis, so an unauthenticated probe can never be used to learn a collection's
+   * real size (see `extendAuthorizedCeilingUsd`'s own doc comment). This is a genuine
+   * top-up-style route (the worker's `resolveAuth` call for it passes `allowTopUp`,
+   * mirroring the account-key deposit flow): the settled charge is computed post-auth from
+   * the collection's real chunk count, and the amount actually SIGNED does not have to equal
+   * the challenge's quoted one — `buildPaymentHeader`'s `amountAtomic` override exists
+   * exactly for this (core's `selectRequirement` treats the challenge as a network/asset/
+   * payTo TEMPLATE when an override is supplied, not a pinned amount). So this method calls
+   * the free, owner-gated `status()` first to learn the real chunk count, computes the REAL
+   * price from it, and signs THAT (via `performOp`'s `pinnedAmountUsd`) regardless of what
+   * the stateless challenge happened to quote. A wrong (too-low) signed amount is rejected
+   * by the worker's own settle check, never silently adjusted — so this is exact-match
+   * pricing, not a ceiling the worker is trusted to round down to.
    *
-   * Account-key mode has no such limit: there is no signature to bound, so the worker
-   * debits the real per-block price directly for a collection of any size up to MAX_CHUNKS.
-   * This method skips the `status()` pre-check entirely in that mode — there is nothing for
-   * it to guard, and the extra round-trip would be pure overhead.
+   * Account-key mode has no signature to bound at all (the worker debits the real per-block
+   * price directly), so it skips the `status()` pre-check entirely — there is nothing for a
+   * pinned amount to protect there, and the extra round-trip would be pure overhead.
    */
   async extend(collection: string, days: 30 | 60 | 90): Promise<ExtendResult> {
     assertValidCollectionName(collection);
@@ -974,25 +995,15 @@ export class AgentRag {
     }
 
     // Wallet mode only (see the doc comment above) — account-key mode has no signature to
-    // bound, so `chunks` stays 0 there and `authorizedCeilingUsd` below is computed but never
-    // read (performOp's bearer branch settles directly).
+    // pin, so `chunks` stays 0 there and the resulting ceiling is computed but never read
+    // (performOp's bearer branch settles directly, without ever reaching the 402 handling
+    // that consults authorizedCeilingUsd/pinnedAmountUsd).
     let chunks = 0;
     if (!this.accountKey) {
       const info = await this.status(collection);
       chunks = info.chunks;
-      const blocks = Math.max(1, Math.ceil(chunks / CHUNKS_PER_BLOCK));
-      if (blocks > 1) {
-        throw new AgentRagError(
-          `collection "${collection}" has ${chunks} chunks (${blocks} extend blocks); a ` +
-            "wallet-mode extend can only pay for 1 block per call, because the server's " +
-            "pre-auth quote is deliberately blind to collection size and a signature can " +
-            "never exceed what it quotes. Use account-key mode, which debits the real " +
-            "per-block price directly with no such limit.",
-          "extend_too_large_for_wallet_mode",
-          0,
-        );
-      }
     }
+    const realAmountUsd = extendAuthorizedCeilingUsd(days, chunks);
 
     const body = { collection, days };
 
@@ -1002,7 +1013,8 @@ export class AgentRag {
       url: `${this.endpoint}/v1/rag/extend`,
       idempotencyKey: freshNonce(),
       label: "extend failed",
-      authorizedCeilingUsd: extendAuthorizedCeilingUsd(days, chunks),
+      authorizedCeilingUsd: realAmountUsd,
+      pinnedAmountUsd: this.accountKey ? undefined : realAmountUsd,
       buildRequest: (headers) => ({
         method: "POST",
         headers: { "content-type": "application/json", ...headers },

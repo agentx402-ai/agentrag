@@ -101,30 +101,39 @@ export function ingestAuthorizedCeilingUsd(
 }
 
 /**
- * Authorized ceiling (USD) for an `extend` call: `max(1, ceil(chunks / CHUNKS_PER_BLOCK))`
- * blocks, times `days / 30`, at the per-block extend price.
+ * The EXACT price (USD) of an `extend` call: `max(1, ceil(chunks / CHUNKS_PER_BLOCK))`
+ * blocks, times `days / 30`, at the per-block extend price — the SAME formula the worker
+ * settles on, given the collection's real chunk count.
  *
  * The worker's own pre-auth 402 challenge for extend is DELIBERATELY STATELESS — it always
  * quotes the 1-block-per-30-days basis (`days / 30` units) regardless of the named
  * collection's real chunk count, because reading the real count pre-auth would make extend
  * an existence/size oracle for an unauthenticated caller. `chunks` defaulting to 0 here
- * (-> the 1-block minimum) MATCHES that stateless quote exactly — but the quote and the
- * SETTLED charge are different things, and a prior version of this comment conflated them
- * (claiming the default "can neither under- nor over-authorize... on a collection of any
- * real size", which is false). The worker settles on the collection's REAL block count, up
- * to 5 at its MAX_CHUNKS. A signed wallet-mode authorization can never exceed what the
- * challenge quoted (see `performOp`'s own doc comment — the client signs the challenge
- * verbatim, never a self-computed sum), so a collection needing more than one block cannot
- * be extended via a single wallet-mode call AT ALL, regardless of what this function
- * computes: `extend()` (index.ts) accounts for this by learning the real chunk count via
- * `status()` first and refusing before ever signing when more than one block is needed —
- * see its own doc comment for the full reasoning.
+ * (-> the 1-block minimum) MATCHES that stateless quote — but the quote and the settled
+ * charge are different things whenever the collection needs more than one block, and a
+ * PRIOR version of this comment conflated them (claiming the default "can neither under-
+ * nor over-authorize... on a collection of any real size", which is false for anything over
+ * one block).
+ *
+ * A signed wallet-mode authorization does NOT have to equal the challenge's quoted amount:
+ * extend is a genuine top-up-style route (the worker's own auth call for it passes
+ * `allowTopUp`), so `buildPaymentHeader`'s `amountAtomic` override lets the client sign the
+ * REAL price this function computes instead — `extend()` (index.ts) calls `status()` first
+ * to learn the real chunk count, computes this function's result from it, and pins THAT as
+ * the signed amount (`performOp`'s `pinnedAmountUsd`) regardless of what the stateless
+ * challenge quoted. An EARLIER version of this fix (since withdrawn) assumed a wallet-mode
+ * signature could never exceed the challenge's own amount and refused any multi-block
+ * extend outright — that assumption was wrong: core's `selectRequirement` treats the
+ * challenge as a network/asset/payTo TEMPLATE whenever an amount override is supplied, not
+ * a pinned ceiling, and the worker's own test suite settles a real multi-block x402 payment
+ * this way. A signed amount that's actually wrong (too low) is rejected by the worker's own
+ * settle check, never silently adjusted — this function must compute the REAL price, not a
+ * safe underestimate of it.
  *
  * `chunks` was originally test-only from the public API's perspective; `extend()` now passes
  * the real value it learns from `status()` in wallet mode (account-key mode never reads this
- * ceiling — `performOp`'s bearer branch settles directly, with no signature to bound, so it
- * skips both this and the `status()` call). Passing a larger value only ever WIDENS the
- * authorized ceiling, never tightens it.
+ * value at all — `performOp`'s bearer branch settles directly, with no signature to pin, so
+ * it skips both this computation's real-chunks input and the `status()` call).
  */
 export function extendAuthorizedCeilingUsd(days: number, chunks = 0): number {
   const blocks = Math.max(1, Math.ceil(chunks / CHUNKS_PER_BLOCK));

@@ -106,9 +106,8 @@ exactly one of `{ privateKey }`, `{ signer }`, or `{ accountKey }`.
 
 - **`extend(collection, days)`** — push a collection's `expires_at` out by `30 | 60 | 90` days.
   Paid, priced on the collection's real chunk count (see **Pricing**) — in wallet mode this method
-  makes a free `status()` read first to price it accurately and to refuse upfront
-  (`extend_too_large_for_wallet_mode`) when the collection is too large for a single wallet-mode
-  payment; account-key mode skips that read (it has no such limit).
+  makes a free `status()` read first and signs the real computed price, regardless of collection
+  size; account-key mode skips that read (the worker debits the real price directly either way).
 
   ```ts
   await rag.extend("my-docs", 90);
@@ -171,13 +170,13 @@ knowing before you're surprised by the quote.
 `extend` is priced on the collection's **real chunk count**, not a flat rate:
 `max(1, ceil(chunks / CHUNKS_PER_BLOCK))` blocks (capped at 5, since a collection caps at 25,000
 chunks) times `days / 30`, at `EXTEND_BLOCK_USD` per unit — a 30-day extend on a collection under
-5,000 chunks costs `EXTEND_BLOCK_USD` ($0.01); a 12,000-chunk collection needs 3 blocks. **Wallet
-mode can only pay for 1 block per call**: the server's pre-auth quote is deliberately blind to
-collection size (so an unauthenticated probe can't be used to learn it), and a signed x402
-authorization can never exceed what that quote states. `extend()` checks the real chunk count via
-a free `status()` call first and throws `extend_too_large_for_wallet_mode` before ever signing when
-more than one block is needed. Account-key mode has no such limit — the worker debits the real
-per-block price directly for a collection of any size.
+5,000 chunks costs `EXTEND_BLOCK_USD` ($0.01); a 12,000-chunk collection needs 3 blocks and costs
+6× that. The server's pre-auth `402` quote is deliberately blind to collection size (so an
+unauthenticated probe can't be used to learn it) and always quotes the 1-block basis — but extend
+is a top-up-style route, so a wallet-mode signature isn't pinned to that quote: `extend()` reads
+the real chunk count via a free `status()` call first and signs the real computed price, whatever
+the collection's actual size. Account-key mode skips that read — the worker debits the real
+per-block price directly from prepaid credits either way, for a collection of any size.
 
 Client-side request limits, enforced before any request is sent (so a malformed call never burns
 a wallet-mode signature the server was always going to reject): `MAX_QUERY_CHARS` (1,000),
@@ -202,11 +201,15 @@ conditionally, and the safe remedy is `extend()`, not "use it again":
 
 ## Money-safety
 
-- **The SDK signs the challenge's exact quoted amount** — never a self-computed sum — pinning the
-  network, the canonical USDC token, and (when you set `expectedPayTo`) the recipient, all checked
-  **before** any signature is produced. A `402` quoting more than this SDK authorized for the
-  request's own shape (see **Pricing**) is refused pre-signature, even with no `maxSpendUsd` set —
-  and when an op declares no ceiling of its own, `DEFAULT_MAX_OP_USD` backstops it.
+- **`ask`/`ingest` sign the challenge's exact quoted amount** — never a self-computed sum for
+  these two — pinning the network, the canonical USDC token, and (when you set `expectedPayTo`)
+  the recipient, all checked **before** any signature is produced. A `402` quoting more than this
+  SDK authorized for the request's own shape (see **Pricing**) is refused pre-signature, even with
+  no `maxSpendUsd` set — and when an op declares no ceiling of its own, `DEFAULT_MAX_OP_USD`
+  backstops it. `extend` is the one exception, by design: its pre-auth quote is deliberately not
+  the real price (see **Pricing**), so it signs its own computed real price instead — that amount
+  is still checked against `maxSpendUsd`/`maxSessionSpendUsd` exactly like any other op, and a
+  wrong (too-low) signed amount is rejected by the worker, never silently adjusted.
 - **Spend caps.** `maxSpendUsd` (per call) and `maxSessionSpendUsd` (cumulative across the client,
   reservation-based so concurrent calls can't all pass the same stale check) throw `SpendCapError`
   before the challenge is signed. Both must be finite and non-negative — a malformed value throws

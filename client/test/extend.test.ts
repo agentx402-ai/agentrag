@@ -38,9 +38,9 @@ function extendEnvelope(
 
 /**
  * A worker-shaped collection-status 200 response, for wallet-mode `extend()`'s own pre-flight
- * `status()` call (the block-size guard — see extend()'s doc comment). `chunks` defaults well
- * under `CHUNKS_PER_BLOCK` so the guard never fires and these tests keep exercising whatever
- * they were written for; tests of the guard itself pass a larger `chunks`.
+ * `status()` call (it learns the real chunk count to pin the real signed amount — see
+ * extend()'s doc comment). `chunks` defaults to a small value well under `CHUNKS_PER_BLOCK`
+ * so tests not specifically about block size get the ordinary 1-block price.
  */
 function statusResponse(chunks = 0): Response {
   return new Response(
@@ -59,24 +59,31 @@ function statusResponse(chunks = 0): Response {
 }
 
 /**
- * A signer spy whose `paymentsProduced()` counts ONLY EIP-3009 payment authorizations
- * (`primaryType: "TransferWithAuthorization"`) — distinct from the FREE EIP-712 identity
- * signature extend()'s own pre-flight `status()` call legitimately produces first
+ * A signer spy that captures the atomic `value` of every EIP-3009 payment authorization
+ * (`primaryType: "TransferWithAuthorization"`) it signs — distinct from the FREE EIP-712
+ * identity signature extend()'s own pre-flight `status()` call legitimately produces first
  * (`primaryType: "Request"`). Both go through the same `signTypedData`, so a plain call
- * counter can't tell "no payment was produced" from "no signature at all was produced" —
- * conflating them is exactly what made the guard tests below fail for the wrong reason
- * when the pre-flight status() call was added.
+ * counter can't tell "no payment was produced" from "no signature at all was produced", and
+ * a plain COUNT can't prove which AMOUNT was actually signed — the whole point of this
+ * round's fix is that it's the REAL computed amount, not the challenge's stateless quote.
  */
 function paymentSigner() {
-  let paymentsProduced = 0;
+  const paymentAmounts: bigint[] = [];
   const spy = {
     ...signer,
     signTypedData: (async (args: Parameters<typeof signer.signTypedData>[0]) => {
-      if (args.primaryType === "TransferWithAuthorization") paymentsProduced++;
+      if (args.primaryType === "TransferWithAuthorization") {
+        const message = args.message as { value: bigint };
+        paymentAmounts.push(BigInt(message.value));
+      }
       return signer.signTypedData(args);
     }) as typeof signer.signTypedData,
   } as typeof signer;
-  return { spy, paymentsProduced: () => paymentsProduced };
+  return {
+    spy,
+    paymentsProduced: () => paymentAmounts.length,
+    paymentAmounts: () => paymentAmounts,
+  };
 }
 
 describe("extend: client-side validation runs BEFORE any request", () => {
@@ -166,28 +173,34 @@ describe("extend: happy path (envelope-wrapped fixtures)", () => {
 });
 
 describe("extend: authorized ceiling (money-safety)", () => {
-  it("a challenge quoting more than the 1-block ceiling is refused BEFORE signing", async () => {
-    // paymentsProduced counts ONLY the EIP-3009 payment signature (primaryType
-    // "TransferWithAuthorization"), not the free identity signature extend()'s own
-    // pre-flight status() call legitimately produces first — see paymentSigner() below.
+  it("a real extend that would exceed maxSpendUsd is refused BEFORE any payment signature", async () => {
+    // The 402's own quote is irrelevant here (see the describe block below) — what must
+    // still gate a real, correctly-priced multi-block extend is the caller's OWN configured
+    // cap. 12,000 chunks -> 3 blocks; 60 days -> 2 units -> 6 units total -> $0.06. A
+    // maxSpendUsd of $0.05 must refuse it, via the ordinary spend-cap path, not a ceiling
+    // mismatch against the challenge.
     const { spy, paymentsProduced } = paymentSigner();
-    const ceiling = extendAuthorizedCeilingUsd(30);
     const fetchImpl = (async (_u: unknown, init?: RequestInit) => {
-      if ((init?.method ?? "GET") === "GET") return statusResponse(); // extend()'s pre-flight status() call
+      if ((init?.method ?? "GET") === "GET") return statusResponse(12_000);
       return new Response("{}", {
         status: 402,
         headers: {
-          "PAYMENT-REQUIRED": challenge(String(usdToAtomic(ceiling + 0.01))),
+          "PAYMENT-REQUIRED": challenge(String(usdToAtomic(extendAuthorizedCeilingUsd(60)))),
         },
       });
     }) as unknown as typeof fetch;
-    const client = new AgentRag({ signer: spy, endpoint, fetchImpl });
+    const client = new AgentRag({
+      signer: spy,
+      endpoint,
+      fetchImpl,
+      maxSpendUsd: 0.05,
+    });
 
-    await expect(client.extend("c1", 30)).rejects.toBeInstanceOf(SpendCapError);
+    await expect(client.extend("big-collection", 60)).rejects.toBeInstanceOf(SpendCapError);
     expect(paymentsProduced()).toBe(0); // no PAYMENT signature was ever produced, not merely unsent
   });
 
-  it("an honest quote at the ceiling is signed (the guard does not false-reject its own ceiling)", async () => {
+  it("an honest 1-block quote is signed (the guard does not false-reject its own ceiling)", async () => {
     let signed = false;
     const ceiling = extendAuthorizedCeilingUsd(90);
     const fetchImpl = (async (_u: unknown, init?: RequestInit) => {
@@ -221,32 +234,54 @@ describe("extend: authorized ceiling (money-safety)", () => {
 
 // The Critical this closes: the worker's pre-auth 402 for extend is deliberately stateless
 // (always quoting the 1-block price, so an unauthenticated probe can't be a collection-size
-// oracle), and a wallet-mode signature can never exceed what the challenge quoted — so a
-// collection needing more than one block can NEVER be extended via a single wallet-mode call,
-// no matter how the ceiling is computed. extend() must refuse BEFORE any probe/signature, not
-// attempt a signed authorization that is provably short.
-describe("extend: wallet-mode block-size guard (money-safety)", () => {
-  it("a 12,000-chunk collection (3 blocks) refuses BEFORE any probe or signature", async () => {
-    // status() itself DOES produce a free identity signature — paymentsProduced counts only
-    // the (never-reached) EIP-3009 payment authorization. See paymentSigner()'s own comment.
-    const { spy, paymentsProduced } = paymentSigner();
-    let calls = 0;
-    const fetchImpl = (async () => {
-      calls++;
-      return statusResponse(12_000);
+// oracle) — but extend is a genuine top-up-style route (the worker's own auth call for it
+// passes `allowTopUp`), so a wallet-mode signature does NOT have to equal the challenge's
+// quoted amount. extend() learns the real chunk count via status() and PINS the real
+// computed price as the signed amount (`buildPaymentHeader`'s `amountAtomic` override),
+// regardless of what the stateless challenge quoted. An earlier version of this fix assumed
+// a signature could never exceed the challenge's amount and refused any multi-block extend
+// outright — withdrawn: that assumption was wrong (see pricing.ts's own doc comment for the
+// full trace). These tests assert the ACTUAL SIGNED AMOUNT, not merely success/failure, so a
+// regression that silently reverted to signing the challenge's stateless quote would be
+// caught even though the mocked "server" here doesn't itself validate the amount.
+describe("extend: wallet-mode pins the real settle amount (money-safety)", () => {
+  it("a 12,000-chunk collection (3 blocks, days 60) signs the real 6-unit amount, not the challenge's 1-block quote", async () => {
+    const { spy, paymentAmounts } = paymentSigner();
+    const fetchImpl = (async (_u: unknown, init?: RequestInit) => {
+      if ((init?.method ?? "GET") === "GET") return statusResponse(12_000);
+      if (init && new Headers(init.headers).get("PAYMENT-SIGNATURE")) {
+        return new Response(
+          JSON.stringify(
+            extendEnvelope({
+              collection: "big-collection",
+              expires_at: "2026-12-01T00:00:00.000Z",
+            }),
+          ),
+          { status: 200 },
+        );
+      }
+      // The stateless 1-block quote (60 days -> 2 units -> $0.02) — deliberately NOT the
+      // real 6-unit ($0.06) price this collection actually needs.
+      return new Response("{}", {
+        status: 402,
+        headers: {
+          "PAYMENT-REQUIRED": challenge(String(usdToAtomic(extendAuthorizedCeilingUsd(60)))),
+        },
+      });
     }) as unknown as typeof fetch;
     const client = new AgentRag({ signer: spy, endpoint, fetchImpl });
 
-    await expect(client.extend("big-collection", 60)).rejects.toMatchObject({
-      code: "extend_too_large_for_wallet_mode",
-    });
-    expect(calls).toBe(1); // only the status() read — no bare probe, no 402, no payment signature
-    expect(paymentsProduced()).toBe(0);
+    const result = await client.extend("big-collection", 60);
+    expect(result.collection).toBe("big-collection");
+    expect(paymentAmounts()).toHaveLength(1);
+    // The REAL amount (3 blocks x 2 units x $0.01 = $0.06), not the challenge's $0.02.
+    expect(paymentAmounts()[0]).toBe(BigInt(usdToAtomic(extendAuthorizedCeilingUsd(60, 12_000))));
+    expect(paymentAmounts()[0]).not.toBe(BigInt(usdToAtomic(extendAuthorizedCeilingUsd(60))));
   });
 
-  it("exactly 5,000 chunks (the 1-block boundary) does NOT refuse", async () => {
-    // Fencepost check: CHUNKS_PER_BLOCK itself must round DOWN to 1 block, not up to 2 — a
-    // boundary bug here would wrongly refuse every collection sitting exactly at the limit.
+  it("exactly 5,000 chunks (the 1-block boundary) signs the 1-block amount", async () => {
+    // Fencepost check: CHUNKS_PER_BLOCK itself must round DOWN to 1 block, not up to 2.
+    const { spy, paymentAmounts } = paymentSigner();
     const fetchImpl = (async (_u: unknown, init?: RequestInit) => {
       if ((init?.method ?? "GET") === "GET") return statusResponse(5_000);
       if (init && new Headers(init.headers).get("PAYMENT-SIGNATURE")) {
@@ -263,26 +298,49 @@ describe("extend: wallet-mode block-size guard (money-safety)", () => {
       return new Response("{}", {
         status: 402,
         headers: {
-          "PAYMENT-REQUIRED": challenge(String(usdToAtomic(extendAuthorizedCeilingUsd(30, 5_000)))),
+          "PAYMENT-REQUIRED": challenge(String(usdToAtomic(extendAuthorizedCeilingUsd(30)))),
         },
       });
     }) as unknown as typeof fetch;
-    const client = new AgentRag({ signer, endpoint, fetchImpl });
+    const client = new AgentRag({ signer: spy, endpoint, fetchImpl });
 
     const result = await client.extend("c1", 30);
     expect(result.expires_at).toBe("2026-12-01T00:00:00.000Z");
+    expect(paymentAmounts()[0]).toBe(BigInt(usdToAtomic(extendAuthorizedCeilingUsd(30, 5_000))));
+    expect(paymentAmounts()[0]).toBe(BigInt(usdToAtomic(extendAuthorizedCeilingUsd(30)))); // == the 1-block price
   });
 
-  it("5,001 chunks (one over the boundary) refuses", async () => {
-    const fetchImpl = (async () => statusResponse(5_001)) as unknown as typeof fetch;
-    const client = new AgentRag({ signer, endpoint, fetchImpl });
+  it("5,001 chunks (one over the boundary) signs the 2-block amount, not 1", async () => {
+    const { spy, paymentAmounts } = paymentSigner();
+    const fetchImpl = (async (_u: unknown, init?: RequestInit) => {
+      if ((init?.method ?? "GET") === "GET") return statusResponse(5_001);
+      if (init && new Headers(init.headers).get("PAYMENT-SIGNATURE")) {
+        return new Response(
+          JSON.stringify(
+            extendEnvelope({
+              collection: "c1",
+              expires_at: "2026-12-01T00:00:00.000Z",
+            }),
+          ),
+          { status: 200 },
+        );
+      }
+      return new Response("{}", {
+        status: 402,
+        headers: {
+          "PAYMENT-REQUIRED": challenge(String(usdToAtomic(extendAuthorizedCeilingUsd(30)))),
+        },
+      });
+    }) as unknown as typeof fetch;
+    const client = new AgentRag({ signer: spy, endpoint, fetchImpl });
 
-    await expect(client.extend("c1", 30)).rejects.toMatchObject({
-      code: "extend_too_large_for_wallet_mode",
-    });
+    const result = await client.extend("c1", 30);
+    expect(result.expires_at).toBe("2026-12-01T00:00:00.000Z");
+    expect(paymentAmounts()[0]).toBe(BigInt(usdToAtomic(extendAuthorizedCeilingUsd(30, 5_001))));
+    expect(paymentAmounts()[0]).not.toBe(BigInt(usdToAtomic(extendAuthorizedCeilingUsd(30)))); // != the 1-block price
   });
 
-  it("account-key mode succeeds on the same 12,000-chunk collection with exactly ONE bearer request (no status() call, no guard)", async () => {
+  it("account-key mode succeeds on the same 12,000-chunk collection with exactly ONE bearer request (no status() call, no signature at all)", async () => {
     const calls: RequestInit[] = [];
     const fetchImpl = (async (_u: unknown, init?: RequestInit) => {
       calls.push(init ?? {});
@@ -298,9 +356,8 @@ describe("extend: wallet-mode block-size guard (money-safety)", () => {
     }) as unknown as typeof fetch;
     const client = new AgentRag({ accountKey: AK, endpoint, fetchImpl });
 
-    // No status() call means the client has no idea this collection has 12,000 chunks — the
-    // worker debits the real per-block price directly and this call still succeeds, unlike
-    // the wallet-mode case above.
+    // No status() call and no signature at all — the worker debits the real per-block price
+    // directly from prepaid credits, which this SDK never needs to compute or pin.
     const result = await client.extend("big-collection", 60);
     expect(result.collection).toBe("big-collection");
     expect(calls).toHaveLength(1);
