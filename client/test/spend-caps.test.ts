@@ -487,7 +487,25 @@ describe("ingest()/extend(): spend recording via the real verbs", () => {
     const ceiling = extendAuthorizedCeilingUsd(30);
     let sigCount = 0;
     let i = 0;
+    // extend()'s own pre-flight status() call (wallet-mode block-size guard) — a small chunk
+    // count so the guard never fires and this test keeps exercising the session cap it was
+    // written for. One of these precedes EACH of the two extend() calls below.
+    const statusOk = () =>
+      new Response(
+        JSON.stringify({
+          data: {
+            collection: "c1",
+            model: "@cf/baai/bge-m3",
+            pages: 1,
+            chunks: 0,
+            created_at: "2026-08-01T00:00:00.000Z",
+            expires_at: "2026-09-01T00:00:00.000Z",
+          },
+        }),
+        { status: 200 },
+      );
     const responses: Array<() => Response> = [
+      statusOk,
       () =>
         new Response("{}", {
           status: 402,
@@ -502,6 +520,7 @@ describe("ingest()/extend(): spend recording via the real verbs", () => {
           }),
           { status: 200 },
         ),
+      statusOk,
       () =>
         new Response("{}", {
           status: 402,
@@ -541,6 +560,15 @@ describe("performOp: 402 edge cases", () => {
     // The wallet-mode bare (unsigned) discovery probe can fail for reasons unrelated to
     // payment — e.g. an upstream 5xx — before the 402/price-and-sign branch is ever
     // reached at all.
+    //
+    // Review fix: the 500 fixture carries a well-formed PAYMENT-REQUIRED challenge on
+    // purpose. A prior version omitted it, which made this test pass whether or not
+    // `res.status === 402` actually gated signing — mutating that guard to `>= 402` widened
+    // it to also match this 500, and with NO challenge header the widened branch immediately
+    // hit the separate `!challenge` throw and rendered the identical `internal_error` this
+    // test asserts, so the mutant stayed green. With a real challenge present, a widened
+    // gate would price-and-sign it instead, which the `produced === 0` assertion below
+    // catches.
     let produced = 0;
     const spy = {
       ...signer,
@@ -552,6 +580,7 @@ describe("performOp: 402 edge cases", () => {
     const fetchImpl = (async () =>
       new Response(JSON.stringify({ error: "upstream", code: "internal_error" }), {
         status: 500,
+        headers: { "PAYMENT-REQUIRED": challenge("8000") },
       })) as unknown as typeof fetch;
     // maxRetries: 0 so the 500 surfaces instead of being retried away by the transport layer.
     const client = new TestClient({

@@ -944,19 +944,54 @@ export class AgentRag {
   }
 
   /**
-   * Push a named collection's `expires_at` out by `days` (30/60/90) without querying it
-   * first. Paid per call: `ceil(chunks / CHUNKS_PER_BLOCK)` blocks (min 1) times
-   * `days / 30`, at the per-block extend price. `extendAuthorizedCeilingUsd(days)` (its
-   * `chunks` defaulted, since this method takes no such argument) authorizes exactly the
-   * worker's own stateless 1-block-per-30-days quote — see that function's own doc comment
-   * for why this is an EXACT match on a collection of any real size, never merely a safe
-   * underestimate: the worker's pre-auth 402 challenge never reveals or depends on the
-   * collection's real chunk count, by design.
+   * Push a named collection's `expires_at` out by `days` (30/60/90). Paid per call:
+   * `max(1, ceil(chunks / CHUNKS_PER_BLOCK))` blocks (capped by the service's own
+   * MAX_CHUNKS at 5 blocks) times `days / 30`, at the per-block extend price — priced on
+   * the collection's REAL chunk count, not a flat rate independent of size (a prior version
+   * of this comment claimed the latter, incorrectly).
+   *
+   * **Wallet mode has a real limit this method actively guards.** The worker's pre-auth 402
+   * challenge for extend is deliberately stateless — it always quotes the 1-block basis, so
+   * an unauthenticated probe can never be used to learn a collection's real size — and a
+   * signed x402 authorization can never exceed what the challenge quoted (`performOp` signs
+   * the challenge verbatim, never a self-computed sum). A collection needing MORE than one
+   * block therefore cannot be extended via a single wallet-mode call, structurally, no
+   * matter what ceiling this method computes: the post-auth settle would demand more than
+   * was signed and fail closed. To avoid burning a real signature on a call that is
+   * provably doomed, this method calls the free, owner-gated `status()` first to learn the
+   * real chunk count, and refuses BEFORE any signature (`extend_too_large_for_wallet_mode`)
+   * when more than one block is needed.
+   *
+   * Account-key mode has no such limit: there is no signature to bound, so the worker
+   * debits the real per-block price directly for a collection of any size up to MAX_CHUNKS.
+   * This method skips the `status()` pre-check entirely in that mode — there is nothing for
+   * it to guard, and the extra round-trip would be pure overhead.
    */
   async extend(collection: string, days: 30 | 60 | 90): Promise<ExtendResult> {
     assertValidCollectionName(collection);
     if (days !== 30 && days !== 60 && days !== 90) {
       throw new AgentRagError(`days must be one of 30, 60, 90 (got ${days})`, "invalid_request", 0);
+    }
+
+    // Wallet mode only (see the doc comment above) — account-key mode has no signature to
+    // bound, so `chunks` stays 0 there and `authorizedCeilingUsd` below is computed but never
+    // read (performOp's bearer branch settles directly).
+    let chunks = 0;
+    if (!this.accountKey) {
+      const info = await this.status(collection);
+      chunks = info.chunks;
+      const blocks = Math.max(1, Math.ceil(chunks / CHUNKS_PER_BLOCK));
+      if (blocks > 1) {
+        throw new AgentRagError(
+          `collection "${collection}" has ${chunks} chunks (${blocks} extend blocks); a ` +
+            "wallet-mode extend can only pay for 1 block per call, because the server's " +
+            "pre-auth quote is deliberately blind to collection size and a signature can " +
+            "never exceed what it quotes. Use account-key mode, which debits the real " +
+            "per-block price directly with no such limit.",
+          "extend_too_large_for_wallet_mode",
+          0,
+        );
+      }
     }
 
     const body = { collection, days };
@@ -967,7 +1002,7 @@ export class AgentRag {
       url: `${this.endpoint}/v1/rag/extend`,
       idempotencyKey: freshNonce(),
       label: "extend failed",
-      authorizedCeilingUsd: extendAuthorizedCeilingUsd(days),
+      authorizedCeilingUsd: extendAuthorizedCeilingUsd(days, chunks),
       buildRequest: (headers) => ({
         method: "POST",
         headers: { "content-type": "application/json", ...headers },

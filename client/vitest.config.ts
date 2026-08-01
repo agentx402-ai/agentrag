@@ -8,8 +8,8 @@ export default defineConfig({
       include: ["src/**/*.ts"],
       reporter: ["text", "text-summary"],
       // Measured at 100/100/100/100 after closing every money-path gap Task 7 found
-      // (up from 95.98/93.22/98.11/97.74 stmts/branches/funcs/lines beforehand — see
-      // task-7-report.md). Thresholds sit a hair under that, not pinned to it: a bare 100
+      // (up from 95.98/93.22/98.11/97.74 stmts/branches/funcs/lines beforehand). Thresholds
+      // sit a hair under that, not pinned to it: a bare 100
       // everywhere is a ratchet with zero slack, failing the whole workspace test run the
       // moment a single future branch (e.g. a defensive guard added ahead of its own test,
       // same style as several already in index.ts) is momentarily uncovered. `functions`

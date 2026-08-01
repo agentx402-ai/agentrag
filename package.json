@@ -20,12 +20,12 @@
   ],
   "scripts": {
     "prepare": "git config core.hooksPath .githooks || true",
-    "build": "npm --workspace client run build && npm --workspace cli run build",
-    "typecheck": "npm --workspace client run typecheck && npm --workspace cli run typecheck",
+    "build": "npm --workspace client run build && { [ ! -d cli ] || npm --workspace cli run build; }",
+    "typecheck": "npm --workspace client run typecheck && { [ ! -d cli ] || npm --workspace cli run typecheck; }",
     "pretest": "npm --workspace client run build",
-    "test": "npm --workspace client test && npm --workspace cli test",
+    "test": "npm --workspace client test && { [ ! -d cli ] || npm --workspace cli test; }",
     "pretest:coverage": "npm --workspace client run build",
-    "test:coverage": "npm --workspace client run test:coverage && npm --workspace cli run test:coverage",
+    "test:coverage": "npm --workspace client run test:coverage && { [ ! -d cli ] || npm --workspace cli run test:coverage; }",
     "lint": "biome ci .",
     "format": "biome check --write ."
   },

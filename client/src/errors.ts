@@ -64,7 +64,12 @@ export type RagErrorCode =
   // Thrown by core's atomicAmountString, reached through buildPaymentHeader and
   // challengePriceUsd — i.e. any malformed amount on the signing path.
   | "invalid_amount"
-  | "ingest_timeout";
+  | "ingest_timeout"
+  // Wallet-mode extend() only, thrown BEFORE any probe/signature: the collection's real chunk
+  // count needs more than the one extend block a single stateless-quoted x402 signature can
+  // ever cover. See extend()'s own doc comment (index.ts) for why no ceiling computation can
+  // fix this client-side — account-key mode has no such limit.
+  | "extend_too_large_for_wallet_mode";
 
 /**
  * Map a worker HTTP response to a typed error. Shared by every verb's failure path.
