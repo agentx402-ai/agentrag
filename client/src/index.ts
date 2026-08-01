@@ -614,16 +614,25 @@ export class AgentRag {
    * full composite ingest charge for work that is already done.
    *
    * I2: the re-ask's idempotency key is DERIVED from the caller's own (`${key}:ask`),
-   * not reused verbatim and not dropped. The real constraint reusing it verbatim would
-   * hit is nonce collision, not `idempotency_conflict` (a wrong claim an earlier version
-   * of this comment made): in wallet mode, `nonceFromIdempotencyKey` deterministically
-   * derives the signed EIP-3009 authorization's nonce FROM the idempotency key, so
-   * presenting the SAME key again would sign with the SAME nonce as the original ask's
-   * own payment — a nonce already marked used server-side the moment that payment
-   * settled. Deriving a distinct-but-stable key instead means a caller who supplies
-   * their OWN `idempotencyKey` gets exactly-once coverage on the leg that actually
-   * bills (the re-ask), not only on the initial, possibly-still-pending call — while a
-   * caller who supplies none still gets a fresh nonce per call, unchanged.
+   * not reused verbatim and not dropped.
+   *
+   * Reusing the key verbatim is NOT an `idempotency_conflict` risk (a wrong claim an
+   * earlier version of this comment made) — the platform's charge-conflict fingerprint
+   * is service+verb only, so two `ask()` calls can never collide on it regardless of
+   * body or amount.
+   *
+   * The real, narrower constraint: in wallet mode, `nonceFromIdempotencyKey`
+   * deterministically seeds the signed EIP-3009 authorization's nonce FROM the
+   * idempotency key, so presenting the SAME key again re-signs with the SAME nonce as
+   * the original ask's own payment. Recovery from an already-used nonce is gated
+   * ON-CHAIN against the PINNED AMOUNT — a same-amount retry recovers cleanly (no
+   * second charge), but the re-ask can legitimately settle a DIFFERENT amount than the
+   * original ask, and a mismatched-amount reuse lands on a THROWING (retryable) path
+   * instead — never a silent free success. Deriving a distinct-but-stable key avoids
+   * depending on that path at all: a caller who supplies their OWN `idempotencyKey`
+   * gets exactly-once coverage on the leg that actually bills (the re-ask), not only on
+   * the initial, possibly-still-pending call — while a caller who supplies none still
+   * gets a fresh nonce per call, unchanged.
    *
    * Throws `ingest_timeout` at `maxWaitMs` (default `DEFAULT_ASK_WAIT_MS`); the job
    * itself keeps running server-side regardless — a timeout here loses patience, not the
@@ -707,11 +716,13 @@ export class AgentRag {
 
   /**
    * Per-attempt auth headers for `pollIngestJobState`. Computed FRESH on every call —
-   * I2: core's `fetchWithRetry` calls `build()` once per attempt specifically so
-   * per-request material (an identity signature's nonce/timestamp) can be regenerated;
-   * a caller that builds headers once and hands the SAME object to every attempt
-   * defeats that, reusing one nonce/timestamp across retries. Spread into a fresh object
-   * literal so both branches unify on plain Record<string, string> (IdentityHeaders has
+   * a prior round's finding, since renumbered by a review revision (kept unlabeled here
+   * rather than guess its current number): core's `fetchWithRetry` calls `build()` once
+   * per attempt specifically so per-request material (an identity signature's
+   * nonce/timestamp) can be regenerated; a caller that builds headers once and hands the
+   * SAME object to every attempt defeats that, reusing one nonce/timestamp across
+   * retries. Spread into a fresh object literal so both branches unify on plain
+   * Record<string, string> (IdentityHeaders has
    * no index signature of its own).
    */
   protected async pollHeaders(path: string): Promise<Record<string, string>> {
