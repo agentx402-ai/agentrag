@@ -25,7 +25,7 @@ graphify-out
 # Local code-review scratch (workflow output + report)
 .review/
 
-# spec-driven-development scratch (briefs/reports live in the executive/ archive)
+# local agent/tooling scratch — never committed
 .superpowers/
 
 # Local dev tooling / pack artifacts
