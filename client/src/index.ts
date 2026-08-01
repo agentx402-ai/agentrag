@@ -6,6 +6,7 @@ import {
 import { getAddress } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { isAccountKeyFormat } from "./account";
+import { assertValidCollectionName, collectionPath } from "./collection";
 import { AgentRagError, ragErrorFromResponse, SpendCapError } from "./errors";
 import {
   buildBearerHeaders,
@@ -17,12 +18,21 @@ import {
   nonceFromIdempotencyKey,
   settledTxHash,
 } from "./payment";
-import { askAuthorizedCeilingUsd } from "./pricing";
+import {
+  askAuthorizedCeilingUsd,
+  extendAuthorizedCeilingUsd,
+  ingestAuthorizedCeilingUsd,
+} from "./pricing";
 import type {
   AgentRagOptions,
   AskOptions,
   AskPending,
   AskResult,
+  CollectionStatus,
+  ExtendResult,
+  IngestDocument,
+  IngestOptions,
+  IngestResult,
   RagModelId,
   Signer,
 } from "./types";
@@ -86,6 +96,13 @@ const ASK_MODES = ["hybrid", "dense", "bm25"] as const;
 // formula when the caller omits `maxPages`; the wire request itself omits `max_pages` too
 // in that case, so the worker applies this same default.
 const DEFAULT_ASK_MAX_PAGES = 20;
+// ingest's OWN `max_pages` default — independently declared server-side (ingest.ts's own
+// inline `let maxPages = 20`), not sourced from DEFAULT_ASK_MAX_PAGES above. Same numeric
+// value as ask's default today by coincidence, not by a shared constant — mirrors the
+// worker's own two routes, which each inline their own default rather than importing one
+// from the other (see ingest.ts's worstCaseIngestPages doc comment for the identical
+// duplicate-rather-than-couple rationale).
+const DEFAULT_INGEST_MAX_PAGES = 20;
 
 /**
  * Fail closed on a malformed money bound. A spend cap that is not a finite, non-negative
@@ -143,6 +160,56 @@ function assertValidSource(entry: string): void {
   }
 }
 
+/**
+ * Mirrors the worker's own per-document validation (ingest.ts's `parseIngestBody`): the
+ * array must be non-empty overall, contain at most MAX_DOCUMENTS entries, and each entry's
+ * `text` must be no larger than MAX_DOCUMENT_BYTES — measured the SAME way the worker
+ * measures it (`TextEncoder().encode(text).length`, i.e. UTF-8 bytes, not JS string length;
+ * a multi-byte character would otherwise let a client-accepted document exceed the server's
+ * real limit). Rejected client-side, before any request — burning a real EIP-3009 signature
+ * in wallet mode on a document set the server would 400 anyway is exactly the M4 waste this
+ * SDK's other pre-request validators (see `assertValidSource`) exist to prevent.
+ *
+ * Deliberately does NOT validate `title`/`url` shape (also checked server-side): both are
+ * free-form strings with no size/count ceiling of their own, so a bad value there doesn't
+ * waste a signature the way an oversized/overcounted `documents` set does — the server's
+ * own 400 is cheap for that case, unlike this one.
+ */
+function assertValidDocuments(documents: IngestDocument[]): void {
+  if (documents.length === 0) {
+    throw new AgentRagError(
+      "documents, if present, must be a non-empty array",
+      "invalid_request",
+      0,
+    );
+  }
+  if (documents.length > MAX_DOCUMENTS) {
+    throw new AgentRagError(
+      `documents must contain at most ${MAX_DOCUMENTS} items (got ${documents.length})`,
+      "invalid_request",
+      0,
+    );
+  }
+  const encoder = new TextEncoder();
+  documents.forEach((doc, i) => {
+    if (typeof doc.text !== "string") {
+      throw new AgentRagError(
+        `documents[${i}].text is required and must be a string`,
+        "invalid_request",
+        0,
+      );
+    }
+    const bytes = encoder.encode(doc.text).length;
+    if (bytes > MAX_DOCUMENT_BYTES) {
+      throw new AgentRagError(
+        `documents[${i}].text must be at most ${MAX_DOCUMENT_BYTES} bytes (got ${bytes})`,
+        "invalid_request",
+        0,
+      );
+    }
+  });
+}
+
 /** Type guard distinguishing a 202 (`AskPending`) from a settled `AskResult`. */
 function isAskPending(result: AskResult | AskPending): result is AskPending {
   return (result as AskPending).status === "ingesting";
@@ -160,7 +227,10 @@ function isAskPending(result: AskResult | AskPending): result is AskPending {
  * `T extends unknown ? ... : never` form below IS a distributive conditional type (a naked
  * type parameter in a conditional distributes), so `DataOf<AskResult | AskPending>`
  * correctly evaluates to `Omit<AskResult, K> | Omit<AskPending, K>` — a proper union
- * retaining each branch's own fields.
+ * retaining each branch's own fields. Reused below (not just by `ask()`) for every other
+ * verb's own envelope unwrap — `ingest()`'s `IngestResult | AskPending`, `extend()`'s
+ * `ExtendResult`, and `status()`'s `CollectionStatus` all go through the identical
+ * mechanism, whether or not their own return type happens to be a union.
  */
 type DataOf<T> = T extends unknown
   ? Omit<T, "usage" | "request_id" | "settledTxHash" | "creditsRemaining">
@@ -488,8 +558,7 @@ export class AgentRag {
    * even read, so an inflated or spoofed quote is refused pre-signature (see performOp).
    *
    * A 202 (the collection is still being ingested) resolves as `AskPending` — NOT an
-   * error. Use `askAndWait` to block until it resolves, or poll `status()` (a later
-   * task's public surface) yourself.
+   * error. Use `askAndWait` to block until it resolves, or poll `status()` yourself.
    */
   async ask(query: string, opts: AskOptions = {}): Promise<AskResult | AskPending> {
     if (typeof query !== "string" || query.trim().length === 0) {
@@ -640,8 +709,8 @@ export class AgentRag {
    * (falling back to `DEFAULT_ASK_POLL_INTERVAL_MS` if that is missing or non-positive).
    *
    * Polling here goes through a MINIMAL internal helper (`pollIngestJobState`) that reads
-   * just the one field this method needs — not the full public `status()` surface
-   * (validation, error mapping, `CollectionStatus` parsing), which is a later task's job.
+   * just the one field this method needs, delegating to the public `status()` below for
+   * the actual request/parse (Task 6) rather than duplicating it.
    */
   async askAndWait(
     query: string,
@@ -715,22 +784,174 @@ export class AgentRag {
   }
 
   /**
-   * Per-attempt auth headers for `pollIngestJobState`. Computed FRESH on every call —
-   * a prior round's finding, since renumbered by a review revision (kept unlabeled here
-   * rather than guess its current number): core's `fetchWithRetry` calls `build()` once
-   * per attempt specifically so per-request material (an identity signature's
+   * Explicit pre-warm / raw-document ingest, and the only way to index `documents` (text
+   * with no URL) or force a `refresh` re-fetch. Paid per call, PER PAGE/PER DOCUMENT unit
+   * (never composite the way `ask`'s on-demand ingest leg is) — `ingestAuthorizedCeilingUsd`
+   * computes the ceiling this SDK authorizes from its OWN pinned prices and the request's
+   * worst-case page count, BEFORE the 402 challenge is even read, so an inflated or spoofed
+   * quote is refused pre-signature (see performOp).
+   *
+   * A source set naming a crawl root or more than 3 new/refreshed exact urls needs a
+   * durable job server-side and resolves as `AskPending` (a 202: `status: "ingesting"`) —
+   * NOT an error, same shape `ask()`'s own on-demand ingest leg returns. A small source set
+   * and/or `documents` resolve inline as an `IngestResult` (200).
+   */
+  async ingest(opts: IngestOptions): Promise<IngestResult | AskPending> {
+    if (opts.sources !== undefined) {
+      // Mirrors ask()'s own M4 check: an empty array passes a per-entry loop vacuously and
+      // would otherwise reach the network only to be 400'd server-side.
+      if (opts.sources.length === 0) {
+        throw new AgentRagError(
+          "sources, if present, must be a non-empty array",
+          "invalid_request",
+          0,
+        );
+      }
+      for (const source of opts.sources) assertValidSource(source);
+    }
+    if (opts.documents !== undefined) assertValidDocuments(opts.documents);
+    if (opts.sources === undefined && opts.documents === undefined) {
+      throw new AgentRagError(
+        "at least one of sources or documents is required",
+        "invalid_request",
+        0,
+      );
+    }
+    if (opts.collection !== undefined) assertValidCollectionName(opts.collection);
+    if (opts.maxPages !== undefined) {
+      if (
+        !Number.isInteger(opts.maxPages) ||
+        opts.maxPages < 1 ||
+        opts.maxPages > MAX_PAGES_PER_CALL
+      ) {
+        throw new AgentRagError(
+          `maxPages must be an integer between 1 and ${MAX_PAGES_PER_CALL} (got ${opts.maxPages})`,
+          "invalid_request",
+          0,
+        );
+      }
+    }
+    // `model`, if present, is forwarded UNVALIDATED (unlike ask()'s `mode` enum check):
+    // deliberately not mirrored client-side — the worker's own model catalog is expected
+    // to grow over time (unlike the small, stable ask `mode` enum), so a hardcoded client
+    // allowlist would go stale and start rejecting valid new models. A bad model id still
+    // gets a clean 400 from the server; the worse-outcome failure mode (silently rejecting
+    // a model the caller can genuinely use) is the one worth avoiding here.
+
+    const body: Record<string, unknown> = {};
+    if (opts.sources !== undefined) body.sources = opts.sources;
+    if (opts.documents !== undefined) body.documents = opts.documents;
+    if (opts.collection !== undefined) body.collection = opts.collection;
+    if (opts.model !== undefined) body.model = opts.model;
+    if (opts.maxPages !== undefined) body.max_pages = opts.maxPages;
+    if (opts.refresh !== undefined) body.refresh = opts.refresh;
+
+    const effectiveMaxPages = opts.maxPages ?? DEFAULT_INGEST_MAX_PAGES;
+
+    return this.performOp<IngestResult | AskPending>({
+      method: "POST",
+      path: "/v1/rag/ingest",
+      url: `${this.endpoint}/v1/rag/ingest`,
+      idempotencyKey: opts.idempotencyKey ?? freshNonce(),
+      label: "ingest failed",
+      authorizedCeilingUsd: ingestAuthorizedCeilingUsd(
+        opts.sources,
+        opts.documents?.length ?? 0,
+        effectiveMaxPages,
+      ),
+      buildRequest: (headers) => ({
+        method: "POST",
+        headers: { "content-type": "application/json", ...headers },
+        body: JSON.stringify(body),
+      }),
+      parseSuccess: async (res) => {
+        // Same envelope-unwrap discipline as ask() — see DataOf's own doc comment and
+        // ask()'s C1-fix comment for why a bare `...env` (no `data` unwrap) would silently
+        // typecheck while leaving every field undefined at runtime.
+        const env = JSON.parse(await res.text()) as {
+          data: DataOf<IngestResult | AskPending>;
+          usage?: IngestResult["usage"];
+          request_id?: string;
+        };
+        return {
+          ...env.data,
+          usage: env.usage,
+          request_id: env.request_id,
+          settledTxHash: settledTxHash(res),
+          creditsRemaining: creditsRemaining(res),
+        };
+      },
+    });
+  }
+
+  /**
+   * Push a named collection's `expires_at` out by `days` (30/60/90) without querying it
+   * first. Paid per call: `ceil(chunks / CHUNKS_PER_BLOCK)` blocks (min 1) times
+   * `days / 30`, at the per-block extend price — `extendAuthorizedCeilingUsd` prices the
+   * WORST case (the 1-block minimum) from `days` alone, since the real chunk count isn't
+   * knowable client-side without an extra round-trip (call `status()` first for a tighter
+   * ceiling on a large collection; see extendAuthorizedCeilingUsd's own doc comment).
+   */
+  async extend(collection: string, days: 30 | 60 | 90): Promise<ExtendResult> {
+    assertValidCollectionName(collection);
+    if (days !== 30 && days !== 60 && days !== 90) {
+      throw new AgentRagError(`days must be one of 30, 60, 90 (got ${days})`, "invalid_request", 0);
+    }
+
+    const body = { collection, days };
+
+    return this.performOp<ExtendResult>({
+      method: "POST",
+      path: "/v1/rag/extend",
+      url: `${this.endpoint}/v1/rag/extend`,
+      idempotencyKey: freshNonce(),
+      label: "extend failed",
+      authorizedCeilingUsd: extendAuthorizedCeilingUsd(days),
+      buildRequest: (headers) => ({
+        method: "POST",
+        headers: { "content-type": "application/json", ...headers },
+        body: JSON.stringify(body),
+      }),
+      parseSuccess: async (res) => {
+        const env = JSON.parse(await res.text()) as {
+          data: DataOf<ExtendResult>;
+          usage?: ExtendResult["usage"];
+          request_id?: string;
+        };
+        return {
+          ...env.data,
+          usage: env.usage,
+          request_id: env.request_id,
+          settledTxHash: settledTxHash(res),
+          creditsRemaining: creditsRemaining(res),
+        };
+      },
+    });
+  }
+
+  /**
+   * Per-attempt auth headers for a FREE, identity-signed (or bearer, in account-key mode)
+   * collection op — `status()`, `delete()`, and (through `status()`) `askAndWait`'s
+   * internal poll. Computed FRESH on every call: core's `fetchWithRetry` calls `build()`
+   * once per attempt specifically so per-request material (an identity signature's
    * nonce/timestamp) can be regenerated; a caller that builds headers once and hands the
    * SAME object to every attempt defeats that, reusing one nonce/timestamp across
-   * retries. Spread into a fresh object literal so both branches unify on plain
-   * Record<string, string> (IdentityHeaders has
-   * no index signature of its own).
+   * retries — `pollIngestJobState` (the predecessor of this method, before it delegated to
+   * `status()`) already established the pattern this follows.
+   *
+   * `method` MUST be the request's REAL verb (GET for status, DELETE for delete) — EIP-712
+   * identity is verified against the actual request method + path, so a hardcoded method
+   * here would make e.g. a DELETE's signature fail verification.
    */
-  protected async pollHeaders(path: string): Promise<Record<string, string>> {
+  protected async identityOrBearerHeaders(
+    method: "GET" | "DELETE",
+    path: string,
+  ): Promise<Record<string, string>> {
     return this.accountKey
       ? buildBearerHeaders(this.accountKey)
       : {
           ...(await buildIdentityHeaders(this.requireSigner(), {
-            method: "GET",
+            method,
             path,
             host: new URL(this.endpoint).host,
             network: this.network,
@@ -739,34 +960,55 @@ export class AgentRag {
   }
 
   /**
+   * Free, identity-signed (or bearer, in account-key mode) collection metadata read —
+   * owner-gated. The worker returns the SAME 404 `collection_not_found` for an absent
+   * collection and one owned by someone else (no existence oracle), and 410
+   * `collection_expired` for an expired-but-unpurged collection the caller genuinely owns.
+   */
+  async status(collection: string): Promise<CollectionStatus> {
+    assertValidCollectionName(collection);
+    const path = collectionPath(collection);
+    const res = await this.fetchWithRetry(`${this.endpoint}${path}`, async () => ({
+      method: "GET",
+      headers: await this.identityOrBearerHeaders("GET", path),
+    }));
+    if (!res.ok) throw await this.asError(res, "collection status failed");
+    const env = JSON.parse(await res.text()) as {
+      data: DataOf<CollectionStatus>;
+      request_id?: string;
+    };
+    return { ...env.data, request_id: env.request_id };
+  }
+
+  /**
+   * Free, identity-signed (or bearer) immediate purge of an owned collection. Same
+   * no-existence-oracle / 410-for-the-true-owner semantics as `status()`.
+   */
+  async delete(collection: string): Promise<{ deleted: true }> {
+    assertValidCollectionName(collection);
+    const path = collectionPath(collection);
+    const res = await this.fetchWithRetry(`${this.endpoint}${path}`, async () => ({
+      method: "DELETE",
+      headers: await this.identityOrBearerHeaders("DELETE", path),
+    }));
+    if (!res.ok) throw await this.asError(res, "collection delete failed");
+    const env = JSON.parse(await res.text()) as {
+      data: { deleted: true };
+      request_id?: string;
+    };
+    return env.data;
+  }
+
+  /**
    * Minimal internal poll of a collection's ingest-job state, used ONLY by `askAndWait`.
-   * `GET /v1/rag/collection/:id` is a FREE, identity-signed (or bearer, in account-key
-   * mode) route — never x402 — so this bypasses `performOp` (built for the paid dance)
-   * entirely. Returns `undefined` when the response's `data` half carries no `job` block
-   * (nothing ever ran there), which `askAndWait` treats the same as a terminal state
-   * (not "running").
-   *
-   * NOT the public `status()` surface — that is a later task's job (full
-   * `CollectionStatus` parsing, error mapping, public API). This helper reads only the
-   * one field `askAndWait` needs; feel free to replace it with a call through the real
-   * `status()` once that lands.
+   * Delegates to the public `status()` above (Task 6) and reads just the one field this
+   * method needs — `undefined` when the response carries no `job` block (nothing ever ran
+   * there), which `askAndWait` treats the same as a terminal state (not "running").
    */
   protected async pollIngestJobState(
     collection: string,
   ): Promise<"running" | "complete" | "failed" | undefined> {
-    const path = `/v1/rag/collection/${encodeURIComponent(collection)}`;
-    const res = await this.fetchWithRetry(`${this.endpoint}${path}`, async () => ({
-      method: "GET",
-      headers: await this.pollHeaders(path),
-    }));
-    if (!res.ok) throw await this.asError(res, "collection status failed");
-    // C2 fix: this route's success body is ALSO the `{ data, request_id }` envelope, and
-    // `job` is nested inside its `data` half — `body.job` is always `undefined`. The
-    // prior round's bug: `askAndWait` treats `undefined` as terminal, so it exited the
-    // wait after exactly one poll regardless of the job's real state.
-    const body = (await res.json()) as {
-      data?: { job?: { state: "running" | "complete" | "failed" } };
-    };
-    return body.data?.job?.state;
+    const result = await this.status(collection);
+    return result.job?.state;
   }
 }
