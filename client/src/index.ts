@@ -1,5 +1,12 @@
 import type { RagModelId } from "./types";
 
+export {
+  AgentRagError,
+  AgentXError,
+  type RagErrorCode,
+  ragErrorFromResponse,
+  SpendCapError,
+} from "./errors";
 export * from "./types";
 
 // Compiled into the published bundle and reported to the service; kept in lockstep with
