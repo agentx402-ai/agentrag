@@ -1,6 +1,6 @@
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { describe, expect, it } from "vitest";
-import { AgentRag, SpendCapError } from "../src/index";
+import { AgentRag, AgentRagError, DEFAULT_MAX_OP_USD, SpendCapError } from "../src/index";
 import {
   askAuthorizedCeilingUsd,
   extendAuthorizedCeilingUsd,
@@ -56,6 +56,28 @@ class TestClient extends AgentRag {
       idempotencyKey,
       label: "ask failed",
       authorizedCeilingUsd,
+      buildRequest: (headers) => ({
+        method: "POST",
+        headers: { "content-type": "application/json", ...headers },
+        body: JSON.stringify({ query: "hi" }),
+      }),
+      parseSuccess: async (res) => JSON.parse(await res.text()),
+    });
+  }
+
+  // Drives `performOp` with `authorizedCeilingUsd` OMITTED from the spec entirely (not
+  // merely `undefined` passed positionally — `syntheticAsk`'s default parameter would mask
+  // that). None of the three real verbs (ask/ingest/extend) ever omit it, so this is the
+  // only way to reach the `else` branch in performOp's 402 handling: the DEFAULT_MAX_OP_USD
+  // backstop via `assertOpPriceCeiling`, documented as "the ONLY guard for an op that
+  // declares no authorizedCeilingUsd of its own".
+  syntheticAskNoCeiling(idempotencyKey: string): Promise<{ collection: string }> {
+    return this.performOp<{ collection: string }>({
+      method: "POST",
+      path: "/v1/rag/ask",
+      url: `${this.endpoint}/v1/rag/ask`,
+      idempotencyKey,
+      label: "ask failed",
       buildRequest: (headers) => ({
         method: "POST",
         headers: { "content-type": "application/json", ...headers },
@@ -333,6 +355,12 @@ describe("spend caps", () => {
     opCeiling(usd: number) {
       this.assertOpPriceCeiling(usd);
     }
+    reserve(usd: number) {
+      return this.reserveSession(usd);
+    }
+    signerOrThrow() {
+      return this.requireSigner();
+    }
   }
 
   it("assertSpend fails CLOSED on a non-finite amount vs the per-call cap", () => {
@@ -351,6 +379,36 @@ describe("spend caps", () => {
     const p = new Probe({ signer, endpoint });
     expect(() => p.opCeiling(Number.NaN)).toThrow(SpendCapError);
     expect(() => p.opCeiling(0.008)).not.toThrow();
+  });
+
+  // `reserveSession` is a thin `this.ledger.reserve(usd)` wrapper that no production call
+  // site uses today (performOp reserves via `assertAndReserveSpend`, the assert+reserve
+  // combination, instead) — it exists as protected surface for a caller that already
+  // asserted and only needs the reservation half. Proven here as a real reservation against
+  // the SESSION cap (not a no-op): reserving pins the amount in flight, a concurrent
+  // over-cap check is refused while it's outstanding, and releasing frees it back up.
+  it("reserveSession reserves against the session cap; its release fn frees the reservation", () => {
+    const p = new Probe({ signer, endpoint, maxSessionSpendUsd: 0.01 });
+    const release = p.reserve(0.008);
+    // 0.008 in flight + 0.005 more would breach the $0.01 cap.
+    expect(() => p.spend(0.005)).toThrow(SpendCapError);
+    release();
+    // Idempotent: a second release must not hand budget back twice.
+    release();
+    // With the reservation freed, the identical $0.005 check now fits.
+    expect(() => p.spend(0.005)).not.toThrow();
+  });
+
+  // `requireSigner` throwing is unreachable through the public constructor in WALLET mode
+  // (one of `signer`/`privateKey` is required whenever `accountKey` is absent) — but
+  // account-key mode legitimately constructs an instance with no `signer` at all, so this
+  // drives the guard directly rather than depending on that invariant never being
+  // accidentally weakened by a future refactor (the same "can't happen, test it anyway"
+  // discipline as the comparison-polarity guards above).
+  it("requireSigner throws invalid_config when no wallet signer is configured", () => {
+    const p = new Probe({ accountKey: `ak_${"a".repeat(64)}`, endpoint });
+    expect(() => p.signerOrThrow()).toThrow(AgentRagError);
+    expect(() => p.signerOrThrow()).toThrow(/wallet signer is required/);
   });
 });
 
@@ -467,5 +525,123 @@ describe("ingest()/extend(): spend recording via the real verbs", () => {
     expect(first.collection).toBe("c1");
     await expect(client.extend("c1", 30)).rejects.toBeInstanceOf(SpendCapError);
     expect(sigCount).toBe(1);
+  });
+});
+
+// performOp's 402-handling edge cases not exercised above: a bare probe that fails for a
+// reason OTHER than 402 (proving `res.status === 402` genuinely gates signing, not merely
+// happens to be true in every other fixture), a malformed challenge response, the inline
+// non-finite-ceiling guard's REAL call site (distinct from Probe's direct
+// `assertOpPriceCeiling` unit test), and the DEFAULT_MAX_OP_USD backstop's own call site
+// (reached only when a caller op declares NO authorizedCeilingUsd — `syntheticAskNoCeiling`;
+// none of ask()/ingest()/extend() ever omit it today, so this is otherwise dead code from
+// the public API's perspective, but it is a real, documented fallback, not speculative).
+describe("performOp: 402 edge cases", () => {
+  it("a bare probe that fails outright (non-402) throws without ever attempting to sign", async () => {
+    // The wallet-mode bare (unsigned) discovery probe can fail for reasons unrelated to
+    // payment — e.g. an upstream 5xx — before the 402/price-and-sign branch is ever
+    // reached at all.
+    let produced = 0;
+    const spy = {
+      ...signer,
+      signTypedData: ((typedData: Parameters<typeof signer.signTypedData>[0]) => {
+        produced++;
+        return signer.signTypedData(typedData);
+      }) as typeof signer.signTypedData,
+    } as typeof signer;
+    const fetchImpl = (async () =>
+      new Response(JSON.stringify({ error: "upstream", code: "internal_error" }), {
+        status: 500,
+      })) as unknown as typeof fetch;
+    // maxRetries: 0 so the 500 surfaces instead of being retried away by the transport layer.
+    const client = new TestClient({
+      signer: spy,
+      endpoint,
+      fetchImpl,
+      maxRetries: 0,
+    });
+
+    const err = await client.syntheticAsk("k1").catch((e) => e);
+    expect(err).toMatchObject({ code: "internal_error", status: 500 });
+    expect(produced).toBe(0);
+  });
+
+  it("a 402 with no PAYMENT-REQUIRED header throws request_failed, NO signature attempted", async () => {
+    let produced = 0;
+    const spy = {
+      ...signer,
+      signTypedData: ((typedData: Parameters<typeof signer.signTypedData>[0]) => {
+        produced++;
+        return signer.signTypedData(typedData);
+      }) as typeof signer.signTypedData,
+    } as typeof signer;
+    const fetchImpl = (async () => new Response("{}", { status: 402 })) as unknown as typeof fetch;
+    const client = new TestClient({ signer: spy, endpoint, fetchImpl });
+
+    const err = await client.syntheticAsk("k1").catch((e) => e);
+    expect(err).toMatchObject({ code: "request_failed", status: 402 });
+    expect(err.message).toMatch(/no PAYMENT-REQUIRED challenge/);
+    expect(produced).toBe(0);
+  });
+
+  it("a non-finite authorizedCeilingUsd refuses to sign at the real performOp call site (defense in depth)", async () => {
+    // Unreachable via the public API today (pricing.ts only ever returns finite numbers to
+    // ask()/ingest()/extend()) — but this is the last gate before a signature, so it is
+    // driven directly, same rationale as the Probe comparison-polarity guards above.
+    let produced = 0;
+    const spy = {
+      ...signer,
+      signTypedData: ((typedData: Parameters<typeof signer.signTypedData>[0]) => {
+        produced++;
+        return signer.signTypedData(typedData);
+      }) as typeof signer.signTypedData,
+    } as typeof signer;
+    const fetchImpl = (async () =>
+      new Response("{}", {
+        status: 402,
+        headers: { "PAYMENT-REQUIRED": challenge("8000") },
+      })) as unknown as typeof fetch;
+    const client = new TestClient({ signer: spy, endpoint, fetchImpl });
+
+    const err = await client.syntheticAsk("k1", Number.NaN).catch((e) => e);
+    expect(err).toBeInstanceOf(SpendCapError);
+    expect(err.message).toMatch(/not a finite amount/);
+    expect(produced).toBe(0);
+  });
+
+  it("an op declaring no authorizedCeilingUsd: an honest quote at the default op ceiling still signs", async () => {
+    const { client, signed, produced } = walletWith({}, [
+      () =>
+        new Response("{}", {
+          status: 402,
+          headers: {
+            "PAYMENT-REQUIRED": challenge(String(usdToAtomic(DEFAULT_MAX_OP_USD))),
+          },
+        }),
+      () =>
+        new Response(JSON.stringify({ collection: "c1", matched: true, chunks: [] }), {
+          status: 200,
+        }),
+    ]);
+    const r = await client.syntheticAskNoCeiling("k1");
+    expect(r.collection).toBe("c1");
+    expect(signed()).toBe(true);
+    expect(produced()).toBe(1);
+  });
+
+  it("an op declaring no authorizedCeilingUsd: a quote over the default op ceiling is refused, no signature", async () => {
+    const over = DEFAULT_MAX_OP_USD + 0.01;
+    const { client, signed, produced } = walletWith({}, [
+      () =>
+        new Response("{}", {
+          status: 402,
+          headers: { "PAYMENT-REQUIRED": challenge(String(usdToAtomic(over))) },
+        }),
+    ]);
+    const err = await client.syntheticAskNoCeiling("k1").catch((e) => e);
+    expect(err).toBeInstanceOf(SpendCapError);
+    expect(err.message).toMatch(new RegExp(`built-in \\$${DEFAULT_MAX_OP_USD} op ceiling`));
+    expect(signed()).toBe(false);
+    expect(produced()).toBe(0);
   });
 });

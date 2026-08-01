@@ -59,6 +59,22 @@ describe("ingest: client-side validation runs BEFORE any request", () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
+  it("a document with a non-string text throws invalid_request with NO request issued", async () => {
+    const fetchImpl = vi.fn();
+    const client = new AgentRag({
+      accountKey: AK,
+      endpoint,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    await expect(
+      client.ingest({
+        // @ts-expect-error deliberately non-string text, simulating an untyped caller
+        documents: [{ text: 123 }],
+      }),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
   it("a document with 100KiB+1 bytes of text throws invalid_request with NO request issued", async () => {
     const fetchImpl = vi.fn();
     const client = new AgentRag({
@@ -262,6 +278,36 @@ describe("ingest: happy paths (envelope-wrapped fixtures — see file header)", 
     expect(result.creditsRemaining).toBe(10);
     expect(result.request_id).toBe("r1");
     expect(result.settledTxHash).toBe("");
+  });
+
+  it("model and refresh pass through to the request body", async () => {
+    let sentBody: Record<string, unknown> | undefined;
+    const fetchImpl = (async (_u: unknown, init?: RequestInit) => {
+      sentBody = JSON.parse(init?.body as string);
+      return new Response(
+        JSON.stringify(
+          ingestEnvelope({
+            collection: "c5",
+            status: "complete",
+            pages_total: 1,
+            pages_failed: 0,
+            chunks: 2,
+            expires_at: "2026-09-01T00:00:00.000Z",
+          }),
+        ),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+    const client = new AgentRag({ accountKey: AK, endpoint, fetchImpl });
+
+    await client.ingest({
+      sources: ["https://a.com/1"],
+      collection: "c5",
+      model: "@cf/baai/bge-large-en-v1.5",
+      refresh: true,
+    });
+    expect(sentBody?.model).toBe("@cf/baai/bge-large-en-v1.5");
+    expect(sentBody?.refresh).toBe(true);
   });
 
   it("a documents-only ingest sends no `sources`", async () => {

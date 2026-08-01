@@ -1,6 +1,6 @@
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { describe, expect, it, vi } from "vitest";
-import { AgentRag, AgentRagError, SpendCapError } from "../src/index";
+import { AgentRag, AgentRagError, DEFAULT_ASK_POLL_INTERVAL_MS, SpendCapError } from "../src/index";
 import { askAuthorizedCeilingUsd } from "../src/pricing";
 
 // Every 200/202 fixture in this file mirrors the REAL wire envelope
@@ -274,6 +274,37 @@ describe("ask: happy paths (envelope-wrapped fixtures — see file header)", () 
     expect(new Headers(calls[0].headers).get("Authorization")).toBe(`Bearer ${AK}`);
     if (!("chunks" in result)) throw new Error("expected AskResult, got AskPending");
     expect(result.collection).toBe("c1");
+  });
+
+  it("topK, mode, maxPages, and refresh pass through to the request body", async () => {
+    let sentBody: Record<string, unknown> | undefined;
+    const fetchImpl = (async (_u: unknown, init?: RequestInit) => {
+      sentBody = JSON.parse(init?.body as string);
+      return new Response(
+        JSON.stringify(
+          askEnvelope({
+            collection: "c1",
+            expires_at: "2026-09-01T00:00:00.000Z",
+            matched: true,
+            chunks: [],
+          }),
+        ),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+    const client = new AgentRag({ accountKey: AK, endpoint, fetchImpl });
+
+    await client.ask("what is x", {
+      collection: "c1",
+      topK: 5,
+      mode: "dense",
+      maxPages: 10,
+      refresh: true,
+    });
+    expect(sentBody?.top_k).toBe(5);
+    expect(sentBody?.mode).toBe("dense");
+    expect(sentBody?.max_pages).toBe(10);
+    expect(sentBody?.refresh).toBe(true);
   });
 
   it("a 202 unwraps data and resolves as AskPending, not an error", async () => {
@@ -551,6 +582,76 @@ describe("askAndWait", () => {
     const reAskBody = JSON.parse(calls[3].body ?? "{}");
     expect(reAskBody.collection).toBe("c1");
     expect(reAskBody.sources).toBeUndefined();
+  });
+
+  it("honors the 202's own retry_after for the poll delay when pollIntervalMs is omitted", async () => {
+    // askAndWait's own doc comment: "ordinarily the wait between polls is governed by the
+    // 202's own retry_after ... not this constant [DEFAULT_ASK_POLL_INTERVAL_MS]". Every
+    // OTHER askAndWait test in this file passes an explicit pollIntervalMs (usually 0) to
+    // skip waiting deterministically — this is the one test that drives the real production
+    // default path: no pollIntervalMs override, and a genuine positive retry_after on the
+    // 202. retry_after: 0.001 -> a 1ms poll delay, proven via a setTimeout spy rather than
+    // merely a short test timeout, so a regression that used some OTHER hardcoded delay
+    // (not the 15s fallback, but also not the server's real value) would still be caught.
+    let step = 0;
+    const fetchImpl = (async () => {
+      step++;
+      if (step === 1) {
+        return new Response(
+          JSON.stringify(
+            askEnvelope({
+              collection: "c1",
+              status: "ingesting",
+              pages_done: 0,
+              pages_total: 1,
+              retry_after: 0.001,
+            }),
+          ),
+          { status: 202 },
+        );
+      }
+      if (step === 2) {
+        return new Response(
+          JSON.stringify(
+            statusEnvelope({
+              collection: "c1",
+              model: "@cf/baai/bge-m3",
+              pages: 1,
+              chunks: 4,
+              created_at: "2026-08-01T00:00:00.000Z",
+              expires_at: "2026-09-01T00:00:00.000Z",
+              job: { pages_done: 1, pages_total: 1, state: "complete" },
+            }),
+          ),
+          { status: 200 },
+        );
+      }
+      return new Response(
+        JSON.stringify(
+          askEnvelope({
+            collection: "c1",
+            expires_at: "2026-09-01T00:00:00.000Z",
+            matched: true,
+            chunks: [],
+          }),
+        ),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+    const client = new AgentRag({ accountKey: AK, endpoint, fetchImpl });
+    const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
+
+    const result = await client.askAndWait("what is x", {
+      sources: ["https://a.com"],
+      maxWaitMs: 5_000,
+      // pollIntervalMs deliberately OMITTED.
+    });
+
+    expect(result.matched).toBe(true);
+    const delays = setTimeoutSpy.mock.calls.map((call) => call[1]);
+    expect(delays).toContain(1); // retry_after (0.001s) * 1000, actually used
+    expect(delays).not.toContain(DEFAULT_ASK_POLL_INTERVAL_MS); // the fallback, NOT used
+    setTimeoutSpy.mockRestore();
   });
 
   /** Drives the same ask -> 202 -> poll(running) -> poll(complete) -> re-ask sequence as
