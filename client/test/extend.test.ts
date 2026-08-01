@@ -1,7 +1,7 @@
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { describe, expect, it, vi } from "vitest";
-import { AgentRag, SpendCapError } from "../src/index";
-import { extendAuthorizedCeilingUsd, usdToAtomic } from "../src/pricing";
+import { AgentRag, MAX_CHUNKS, SpendCapError } from "../src/index";
+import { extendAuthorizedCeilingUsd, maxExtendAmountUsd, usdToAtomic } from "../src/pricing";
 
 const endpoint = "https://rag.example";
 const signer = privateKeyToAccount(generatePrivateKey());
@@ -362,5 +362,82 @@ describe("extend: wallet-mode pins the real settle amount (money-safety)", () =>
     expect(result.collection).toBe("big-collection");
     expect(calls).toHaveLength(1);
     expect(new Headers(calls[0]?.headers).get("Authorization")).toBe(`Bearer ${AK}`);
+  });
+});
+
+// The Critical this closes: the ceiling passed to performOp must NOT be derived from the
+// SAME server-supplied chunk count as the amount being signed, or the check degenerates to
+// comparing a number against itself — always true, no matter how large or implausible that
+// number is. A prior round of this fix (since withdrawn) did exactly that
+// (`authorizedCeilingUsd: realAmountUsd` where `realAmountUsd` came from `status()`), and a
+// reviewer demonstrated it signing an unbounded authorization at $2,000,000. The ceiling is
+// now `maxExtendAmountUsd(days)` — a STRUCTURAL bound derived from the service's own
+// MAX_CHUNKS cap, independent of any single response — so it can actually refuse.
+describe("extend: structural ceiling clamps a server-supplied chunk count (money-safety)", () => {
+  it("a chunk count implying an impossible collection (1,000,000, far past MAX_CHUNKS) refuses to sign", async () => {
+    const { spy, paymentsProduced } = paymentSigner();
+    const fetchImpl = (async (_u: unknown, init?: RequestInit) => {
+      if ((init?.method ?? "GET") === "GET") return statusResponse(1_000_000);
+      return new Response("{}", {
+        status: 402,
+        headers: {
+          "PAYMENT-REQUIRED": challenge(String(usdToAtomic(extendAuthorizedCeilingUsd(90)))),
+        },
+      });
+    }) as unknown as typeof fetch;
+    const client = new AgentRag({ signer: spy, endpoint, fetchImpl });
+
+    await expect(client.extend("c1", 90)).rejects.toBeInstanceOf(SpendCapError);
+    expect(paymentsProduced()).toBe(0); // no PAYMENT signature was ever produced, not merely unsent
+  });
+
+  it("one chunk OVER MAX_CHUNKS (25,001, implying 6 blocks — impossible for any real collection) refuses to sign", async () => {
+    const { spy, paymentsProduced } = paymentSigner();
+    const fetchImpl = (async (_u: unknown, init?: RequestInit) => {
+      if ((init?.method ?? "GET") === "GET") return statusResponse(MAX_CHUNKS + 1);
+      return new Response("{}", {
+        status: 402,
+        headers: {
+          "PAYMENT-REQUIRED": challenge(String(usdToAtomic(extendAuthorizedCeilingUsd(90)))),
+        },
+      });
+    }) as unknown as typeof fetch;
+    const client = new AgentRag({ signer: spy, endpoint, fetchImpl });
+
+    await expect(client.extend("c1", 90)).rejects.toBeInstanceOf(SpendCapError);
+    expect(paymentsProduced()).toBe(0);
+  });
+
+  it("exactly MAX_CHUNKS (25,000) at 90 days — the true legitimate boundary — still succeeds", async () => {
+    // Fencepost check in the OTHER direction from the two refusals above: the structural
+    // ceiling must not be so tight that it rejects the largest collection the service
+    // itself allows to exist.
+    const { spy, paymentAmounts } = paymentSigner();
+    const fetchImpl = (async (_u: unknown, init?: RequestInit) => {
+      if ((init?.method ?? "GET") === "GET") return statusResponse(MAX_CHUNKS);
+      if (init && new Headers(init.headers).get("PAYMENT-SIGNATURE")) {
+        return new Response(
+          JSON.stringify(
+            extendEnvelope({
+              collection: "c1",
+              expires_at: "2027-01-01T00:00:00.000Z",
+            }),
+          ),
+          { status: 200 },
+        );
+      }
+      return new Response("{}", {
+        status: 402,
+        headers: {
+          "PAYMENT-REQUIRED": challenge(String(usdToAtomic(extendAuthorizedCeilingUsd(90)))),
+        },
+      });
+    }) as unknown as typeof fetch;
+    const client = new AgentRag({ signer: spy, endpoint, fetchImpl });
+
+    const result = await client.extend("c1", 90);
+    expect(result.expires_at).toBe("2027-01-01T00:00:00.000Z");
+    // 5 blocks x 3 units x $0.01 = $0.15 — exactly maxExtendAmountUsd(90), the ceiling itself.
+    expect(paymentAmounts()[0]).toBe(BigInt(usdToAtomic(maxExtendAmountUsd(90))));
   });
 });

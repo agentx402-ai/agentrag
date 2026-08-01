@@ -24,6 +24,7 @@ import {
   CHUNKS_PER_BLOCK,
   EXTEND_BLOCK_USD,
   INGEST_PAGE_USD,
+  MAX_CHUNKS,
   MAX_DOCUMENTS,
 } from "./index";
 
@@ -134,9 +135,36 @@ export function ingestAuthorizedCeilingUsd(
  * the real value it learns from `status()` in wallet mode (account-key mode never reads this
  * value at all — `performOp`'s bearer branch settles directly, with no signature to pin, so
  * it skips both this computation's real-chunks input and the `status()` call).
+ *
+ * DO NOT pass this function's own result as `performOp`'s `authorizedCeilingUsd` when
+ * `chunks` came from `status()` (a SERVER-supplied value) — that was round 2's bug (since
+ * fixed): the ceiling and the pinned amount became the identical expression, so the
+ * "ceiling" check degenerated to `x <= x`, always true, and a server returning an
+ * arbitrary/inflated chunk count got an unbounded signature. The ceiling passed to
+ * `performOp` MUST be `maxExtendAmountUsd(days)` below — a bound derived from the
+ * service's own STRUCTURAL cap, independent of any single server response — while this
+ * function's result (from the real, server-supplied chunk count) is what's actually
+ * pinned as the signed amount. See extend()'s own doc comment for the full reasoning.
  */
 export function extendAuthorizedCeilingUsd(days: number, chunks = 0): number {
   const blocks = Math.max(1, Math.ceil(chunks / CHUNKS_PER_BLOCK));
   const units30d = days / 30;
   return blocks * units30d * EXTEND_BLOCK_USD;
+}
+
+/**
+ * The ABSOLUTE MAXIMUM legitimate price (USD) for an `extend` call at `days`, for a
+ * collection of ANY size — derived from the service's own structural cap on collection
+ * size (`MAX_CHUNKS`), NOT from any server-supplied chunk count. This is what `extend()`
+ * passes to `performOp` as `authorizedCeilingUsd`; `extendAuthorizedCeilingUsd(days,
+ * realChunks)` (the server-supplied value) is what gets PINNED as the signed amount. The
+ * two must come from independent sources — see `extendAuthorizedCeilingUsd`'s own doc
+ * comment for the bug this closes. `MAX_CHUNKS` is a genuine hard limit (ingest itself
+ * refuses past it with `collection_full`), so no LEGITIMATE extend can ever exceed this
+ * ceiling — it is exact at the true boundary (a real 25,000-chunk, 90-day collection costs
+ * exactly this), never merely a safe overestimate that would falsely reject a large but
+ * real collection.
+ */
+export function maxExtendAmountUsd(days: number): number {
+  return extendAuthorizedCeilingUsd(days, MAX_CHUNKS);
 }

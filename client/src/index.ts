@@ -22,6 +22,7 @@ import {
   askAuthorizedCeilingUsd,
   extendAuthorizedCeilingUsd,
   ingestAuthorizedCeilingUsd,
+  maxExtendAmountUsd,
   usdToAtomic,
 } from "./pricing";
 import type {
@@ -118,6 +119,12 @@ export const ASK_BASE_USD = 0.008;
 export const INGEST_PAGE_USD = 0.005;
 export const EXTEND_BLOCK_USD = 0.01;
 export const CHUNKS_PER_BLOCK = 5_000;
+// The service's own hard cap on a single collection's chunk count — ingest itself refuses
+// (`collection_full`) past this, so no LEGITIMATE collection can ever exceed it. Used as a
+// STRUCTURAL bound for extend()'s authorized ceiling, independent of any server-supplied
+// chunk count — see pricing.ts's `maxExtendAmountUsd` and extend()'s own doc comment for why
+// that independence is money-safety critical, not merely defensive.
+export const MAX_CHUNKS = 25_000;
 
 // Backstop + float slack, both copied from agentscout/client/src/index.ts:
 /** Ceiling for any op declaring no authorizedCeilingUsd, when no maxSpendUsd is set. */
@@ -984,6 +991,26 @@ export class AgentRag {
    * by the worker's own settle check, never silently adjusted — so this is exact-match
    * pricing, not a ceiling the worker is trusted to round down to.
    *
+   * **The authorized ceiling passed to `performOp` is `maxExtendAmountUsd(days)`, NOT
+   * `extendAuthorizedCeilingUsd(days, chunks)`.** `chunks` here is SERVER-supplied (from
+   * `status()`) — passing a ceiling derived from that same value would make the ceiling
+   * check `pinnedAmountUsd <= ceiling` degenerate into comparing a number against itself,
+   * always true, for ANY value the server returns (a bug an earlier round of this fix
+   * shipped and withdrew: a compromised or malfunctioning server returning an arbitrary
+   * chunk count got an unbounded signature). `maxExtendAmountUsd` is derived from the
+   * service's own STRUCTURAL cap on collection size instead, independent of this specific
+   * server response, so a chunk count implying an impossible collection is refused before
+   * signing rather than trusted.
+   *
+   * **Stale-read race (bounded, fails closed):** the real chunk count is read once, before
+   * signing. A concurrent `ingest` against the same collection between that read and the
+   * server processing this signed payment can raise the real chunk count in the meantime,
+   * making the already-signed amount too low for what the worker computes at settle time.
+   * The settle then fails (the worker rejects an insufficient authorization, exactly as it
+   * would any other wrong amount — see `extendAuthorizedCeilingUsd`'s doc comment) rather
+   * than under-charging; retrying `extend()` re-reads the current count and succeeds. This
+   * is a liveness cost under concurrent write activity, never a money-safety one.
+   *
    * Account-key mode has no signature to bound at all (the worker debits the real per-block
    * price directly), so it skips the `status()` pre-check entirely — there is nothing for a
    * pinned amount to protect there, and the extra round-trip would be pure overhead.
@@ -995,7 +1022,7 @@ export class AgentRag {
     }
 
     // Wallet mode only (see the doc comment above) — account-key mode has no signature to
-    // pin, so `chunks` stays 0 there and the resulting ceiling is computed but never read
+    // pin, so `chunks` stays 0 there and the resulting amount is computed but never read
     // (performOp's bearer branch settles directly, without ever reaching the 402 handling
     // that consults authorizedCeilingUsd/pinnedAmountUsd).
     let chunks = 0;
@@ -1003,7 +1030,12 @@ export class AgentRag {
       const info = await this.status(collection);
       chunks = info.chunks;
     }
+    // The amount to SIGN (from the server-supplied chunk count) and the ceiling to check it
+    // AGAINST (from the service's structural cap, NOT from `chunks`) must come from
+    // independent sources — see the doc comment above for the bug that collapsing them into
+    // one value caused.
     const realAmountUsd = extendAuthorizedCeilingUsd(days, chunks);
+    const structuralCeilingUsd = maxExtendAmountUsd(days);
 
     const body = { collection, days };
 
@@ -1013,7 +1045,7 @@ export class AgentRag {
       url: `${this.endpoint}/v1/rag/extend`,
       idempotencyKey: freshNonce(),
       label: "extend failed",
-      authorizedCeilingUsd: realAmountUsd,
+      authorizedCeilingUsd: structuralCeilingUsd,
       pinnedAmountUsd: this.accountKey ? undefined : realAmountUsd,
       buildRequest: (headers) => ({
         method: "POST",

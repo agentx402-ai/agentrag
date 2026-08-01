@@ -178,6 +178,13 @@ the real chunk count via a free `status()` call first and signs the real compute
 the collection's actual size. Account-key mode skips that read — the worker debits the real
 per-block price directly from prepaid credits either way, for a collection of any size.
 
+That chunk count is read once, before signing. If a concurrent `ingest` against the same
+collection raises the real chunk count between that read and the server processing the payment,
+the already-signed amount can end up too low — the call fails (the server rejects an insufficient
+authorization, the same as any other wrong amount) rather than under-charging. Retrying `extend()`
+re-reads the current count and succeeds; this is a liveness cost under concurrent writes, not a
+money-safety one.
+
 Client-side request limits, enforced before any request is sent (so a malformed call never burns
 a wallet-mode signature the server was always going to reject): `MAX_QUERY_CHARS` (1,000),
 `MAX_TOP_K` (20 — the service currently returns 8 chunks by default when `topK` is omitted),
