@@ -1,7 +1,7 @@
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { describe, expect, it, vi } from "vitest";
-import { AgentRag, MAX_CHUNKS, SpendCapError } from "../src/index";
-import { extendAuthorizedCeilingUsd, maxExtendAmountUsd, usdToAtomic } from "../src/pricing";
+import { AgentRag, EXTEND_BLOCK_USD, MAX_CHUNKS, SpendCapError } from "../src/index";
+import { extendAuthorizedCeilingUsd, usdToAtomic } from "../src/pricing";
 
 const endpoint = "https://rag.example";
 const signer = privateKeyToAccount(generatePrivateKey());
@@ -408,13 +408,18 @@ describe("extend: structural ceiling clamps a server-supplied chunk count (money
     expect(paymentsProduced()).toBe(0);
   });
 
-  it("exactly MAX_CHUNKS (25,000) at 90 days — the true legitimate boundary — still succeeds", async () => {
+  it("exactly 25,000 chunks (MAX_CHUNKS) at 90 days — the true legitimate boundary — still succeeds", async () => {
     // Fencepost check in the OTHER direction from the two refusals above: the structural
     // ceiling must not be so tight that it rejects the largest collection the service
-    // itself allows to exist.
+    // itself allows to exist. The chunk count (25,000) and the expected price (5 blocks x 3
+    // units x $0.01) are both HARDCODED literals here, not re-derived via MAX_CHUNKS /
+    // maxExtendAmountUsd — a mutation to either would otherwise shift this test's own
+    // expectation right along with the code under test, so it would never notice (this is
+    // exactly how a real MAX_CHUNKS-too-tight mutation slipped past this test on its first
+    // draft, caught only incidentally by an unrelated test elsewhere in this file).
     const { spy, paymentAmounts } = paymentSigner();
     const fetchImpl = (async (_u: unknown, init?: RequestInit) => {
-      if ((init?.method ?? "GET") === "GET") return statusResponse(MAX_CHUNKS);
+      if ((init?.method ?? "GET") === "GET") return statusResponse(25_000);
       if (init && new Headers(init.headers).get("PAYMENT-SIGNATURE")) {
         return new Response(
           JSON.stringify(
@@ -437,7 +442,6 @@ describe("extend: structural ceiling clamps a server-supplied chunk count (money
 
     const result = await client.extend("c1", 90);
     expect(result.expires_at).toBe("2027-01-01T00:00:00.000Z");
-    // 5 blocks x 3 units x $0.01 = $0.15 — exactly maxExtendAmountUsd(90), the ceiling itself.
-    expect(paymentAmounts()[0]).toBe(BigInt(usdToAtomic(maxExtendAmountUsd(90))));
+    expect(paymentAmounts()[0]).toBe(BigInt(usdToAtomic(5 * 3 * EXTEND_BLOCK_USD)));
   });
 });
