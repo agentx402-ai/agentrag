@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { UsageBlock } from "../src/types";
+import type { RagUsageBlock } from "../src/types";
 import { totalPriceUsd } from "../src/usage";
 
 // Spec §11.1: top-level `price_usd` is the PRIMARY verb's price on the taken path only;
@@ -7,8 +7,12 @@ import { totalPriceUsd } from "../src/usage";
 // request's true cost is price_usd + the sum of every breakdown entry — reading price_usd
 // alone silently drops the ingest leg. This was misread three separate times while writing
 // a live test harness against the deployed service, which is the evidence callers will too.
+//
+// Typed as RagUsageBlock (not core's own UsageBlock): the installed @agentx402-ai/core@0.3.0
+// predates `breakdown`/`expiring_soon` landing on core's main, so only this SDK's own
+// superset type (types.ts) declares them today — see the doc comment there.
 
-function usage(overrides: Partial<UsageBlock> = {}): UsageBlock {
+function usage(overrides: Partial<RagUsageBlock> = {}): RagUsageBlock {
   return {
     service: "rag",
     op: "ask",

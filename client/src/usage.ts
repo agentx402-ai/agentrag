@@ -9,15 +9,16 @@
 // This is easy to misread: a pay-on-success ask that misses reports `price_usd: 0` even
 // when its ingest leg genuinely settled (honest per-leg accounting, not a free ride), so a
 // caller who reads only the top level sees "$0" for a request that really cost money.
-import type { UsageBlock } from "./types";
+import type { RagUsageBlock } from "./types";
 
 /**
  * The request's true total cost in USD: the primary verb's `price_usd` plus every
  * `breakdown[]` leg's `price_usd` (spec §11.1). `undefined` usage (e.g. a free op) totals
  * to 0. An absent `breakdown` sums to 0, same as an explicitly empty one — both mean "no
- * additional legs".
+ * additional legs". Takes `RagUsageBlock` (this SDK's superset of core's `UsageBlock` —
+ * see the doc comment on that interface in types.ts) since `breakdown` is the whole point.
  */
-export function totalPriceUsd(usage: UsageBlock | undefined): number {
+export function totalPriceUsd(usage: RagUsageBlock | undefined): number {
   if (usage === undefined) return 0;
   const breakdownTotal = (usage.breakdown ?? []).reduce((sum, leg) => sum + leg.price_usd, 0);
   return usage.price_usd + breakdownTotal;

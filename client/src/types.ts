@@ -1,18 +1,22 @@
-import type { UsageBlock as CoreUsageBlock, Signer } from "@agentx402-ai/core";
+import type { Signer, UsageBlock } from "@agentx402-ai/core";
 
-export type { Signer };
+export type { Signer, UsageBlock };
 
 // TEMPORARY WORKAROUND (tracked in the task list as "Release core 0.4.0
-// (breakdown/expiring_soon)", owner-gated): the PUBLISHED @agentx402-ai/core@0.3.0
-// predates the commit that added `breakdown`/`expiring_soon` to UsageBlock on core's own
-// main branch — core's package.json was never bumped off 0.3.0, so npm's 0.3.0 lacks
-// fields core's own source already carries. `totalPriceUsd` (usage.ts) needs `breakdown`
-// today, so this SDK carries its own copy of the two fields until core ships 0.4.0 and
-// this package's dependency bumps to match. Every other file in this SDK imports the
-// PUBLIC name `UsageBlock` from "./types" (never `RagUsageBlock` directly), so once core
-// 0.4.0 lands, collapsing this back to a plain `export type { UsageBlock } from
-// "@agentx402-ai/core";` and deleting RagUsageBlock is a one-file diff.
-export interface RagUsageBlock extends CoreUsageBlock {
+// (breakdown/expiring_soon)", owner-gated; ruling confirmed independently by the
+// controller, who verified the installed node_modules/@agentx402-ai/core/dist/index.d.ts
+// directly): the PUBLISHED @agentx402-ai/core@0.3.0 predates the commit that added
+// `breakdown`/`expiring_soon` to UsageBlock on core's own main branch — core's
+// package.json was never bumped off 0.3.0, so npm's 0.3.0 lacks fields core's own source
+// already carries. The service genuinely emits a breakdown leg on a composite ask (the
+// worker's ask route wraps its response in `withBreakdown`), so the client must model it
+// today rather than wait for the release. `UsageBlock` above stays a PLAIN, unmodified
+// re-export of core's own type (for compatibility with anything typed against core
+// directly); `RagUsageBlock` below is an ADDITIONAL, superset export — extended, never
+// redeclared, so the two cannot drift — used wherever this SDK's own wire responses
+// actually carry the two fields. Once core ships 0.4.0 with these fields natively, fold
+// them back: replace each `RagUsageBlock` usage with `UsageBlock` and delete this interface.
+export interface RagUsageBlock extends UsageBlock {
   /**
    * Composite-op itemization: additional charge legs beyond the primary verb (e.g. an
    * AgentRAG ask that also ingested pages). The top-level `price_usd` is the PRIMARY
@@ -29,7 +33,6 @@ export interface RagUsageBlock extends CoreUsageBlock {
    */
   expiring_soon?: true;
 }
-export type UsageBlock = RagUsageBlock;
 
 /** Embedding model backing a collection. Fixed at collection creation — an `ingest` against
  * an existing collection with a different model is rejected server-side (model_mismatch). */
@@ -111,7 +114,7 @@ export interface AskResult {
   chunks: RagChunk[];
   /** Present when this ask also triggered or observed a background ingest. */
   ingest?: IngestProgress;
-  usage?: UsageBlock;
+  usage?: RagUsageBlock;
   request_id?: string;
   /**
    * On-chain settlement txHash for this op, or `""` when it settled on credits (nothing
@@ -139,7 +142,7 @@ export interface AskPending {
    * Present only on `ingest`'s 202, which settles its charge before returning.
    * `ask`'s 202 computes usage later in the request and therefore sends none.
    */
-  usage?: UsageBlock;
+  usage?: RagUsageBlock;
   request_id?: string;
   /**
    * On-chain settlement txHash for a charge ALREADY settled before this 202 (e.g. an
@@ -175,7 +178,7 @@ export interface IngestResult {
   pages_failed: number;
   chunks: number;
   expires_at: string;
-  usage?: UsageBlock;
+  usage?: RagUsageBlock;
   request_id?: string;
   /** Mirrors `AskResult.settledTxHash` — populate from `settledTxHash()` in payment.ts. */
   settledTxHash: string;
@@ -186,7 +189,7 @@ export interface IngestResult {
 export interface ExtendResult {
   collection: string;
   expires_at: string;
-  usage?: UsageBlock;
+  usage?: RagUsageBlock;
   request_id?: string;
   /** Mirrors `AskResult.settledTxHash` — populate from `settledTxHash()` in payment.ts. */
   settledTxHash: string;
