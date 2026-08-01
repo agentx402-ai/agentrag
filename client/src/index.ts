@@ -24,7 +24,6 @@ import type {
   AskPending,
   AskResult,
   RagModelId,
-  RagUsageBlock,
   Signer,
 } from "./types";
 
@@ -574,7 +573,7 @@ export class AgentRag {
             AskResult | AskPending,
             "usage" | "request_id" | "settledTxHash" | "creditsRemaining"
           >;
-          usage?: RagUsageBlock;
+          usage?: AskResult["usage"];
           request_id?: string;
         };
         // Cast needed: TS spreads a UNION-typed value conservatively, keeping only
@@ -583,7 +582,7 @@ export class AgentRag {
         // own. The shape is already pinned by `env`'s own type assertion above; this
         // cast just carries that same trust through the spread, not a new one.
         return {
-          ...env.data,
+          ...(env as unknown as AskResult),
           usage: env.usage,
           request_id: env.request_id,
           settledTxHash: settledTxHash(res),
@@ -727,6 +726,6 @@ export class AgentRag {
     const body = (await res.json()) as {
       data?: { job?: { state: "running" | "complete" | "failed" } };
     };
-    return body.data?.job?.state;
+    return (body as unknown as { job?: { state: "running" | "complete" | "failed" } }).job?.state;
   }
 }

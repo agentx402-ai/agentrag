@@ -9,16 +9,23 @@
 // This is easy to misread: a pay-on-success ask that misses reports `price_usd: 0` even
 // when its ingest leg genuinely settled (honest per-leg accounting, not a free ride), so a
 // caller who reads only the top level sees "$0" for a request that really cost money.
-import type { RagUsageBlock } from "./types";
+import type { AskResult } from "./types";
 
 /**
  * The request's true total cost in USD: the primary verb's `price_usd` plus every
  * `breakdown[]` leg's `price_usd` (spec §11.1). `undefined` usage (e.g. a free op) totals
  * to 0. An absent `breakdown` sums to 0, same as an explicitly empty one — both mean "no
- * additional legs". Takes `RagUsageBlock` (this SDK's superset of core's `UsageBlock` —
- * see the doc comment on that interface in types.ts) since `breakdown` is the whole point.
+ * additional legs".
+ *
+ * Typed as `AskResult["usage"]` rather than naming `RagUsageBlock` directly: that
+ * interface is deliberately module-private to types.ts (I3 — it must never be
+ * independently importable, so it never acquires a semver obligation of its own), but its
+ * shape is exactly what every paid result's `usage` field carries. Indexing through an
+ * already-public field type gets the real shape (including `breakdown`) without needing
+ * the private name — any of `AskResult`/`AskPending`/`IngestResult`/`ExtendResult` would
+ * give the identical type here, since all four share one declaration.
  */
-export function totalPriceUsd(usage: RagUsageBlock | undefined): number {
+export function totalPriceUsd(usage: AskResult["usage"]): number {
   if (usage === undefined) return 0;
   const breakdownTotal = (usage.breakdown ?? []).reduce((sum, leg) => sum + leg.price_usd, 0);
   return usage.price_usd + breakdownTotal;

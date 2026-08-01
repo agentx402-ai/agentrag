@@ -24,7 +24,7 @@ export type { Signer, UsageBlock };
 // (`export type RagUsageBlock = UsageBlock;`), which is NOT a breaking change for any
 // consumer — a type alias to a structurally-identical shape is fully transparent to
 // existing imports of the name.
-export interface RagUsageBlock extends UsageBlock {
+interface RagUsageBlock extends UsageBlock {
   /**
    * Composite-op itemization: additional charge legs beyond the primary verb (e.g. an
    * AgentRAG ask that also ingested pages). The top-level `price_usd` is the PRIMARY

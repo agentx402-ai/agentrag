@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { RagUsageBlock } from "../src/types";
+import type { AskResult } from "../src/types";
 import { totalPriceUsd } from "../src/usage";
 
 // Spec §11.1: top-level `price_usd` is the PRIMARY verb's price on the taken path only;
@@ -8,11 +8,14 @@ import { totalPriceUsd } from "../src/usage";
 // alone silently drops the ingest leg. This was misread three separate times while writing
 // a live test harness against the deployed service, which is the evidence callers will too.
 //
-// Typed as RagUsageBlock (not core's own UsageBlock): the installed @agentx402-ai/core@0.3.0
-// predates `breakdown`/`expiring_soon` landing on core's main, so only this SDK's own
-// superset type (types.ts) declares them today — see the doc comment there.
+// Typed via AskResult["usage"] (not core's own UsageBlock, and not RagUsageBlock by name —
+// that interface is deliberately module-private to types.ts, per I3): the installed
+// @agentx402-ai/core@0.3.0 predates `breakdown`/`expiring_soon` landing on core's main, so
+// only this SDK's own (private) superset type declares them today — see its doc comment.
 
-function usage(overrides: Partial<RagUsageBlock> = {}): RagUsageBlock {
+type Usage = NonNullable<AskResult["usage"]>;
+
+function usage(overrides: Partial<Usage> = {}): Usage {
   return {
     service: "rag",
     op: "ask",
