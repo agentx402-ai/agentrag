@@ -104,14 +104,22 @@ export function ingestAuthorizedCeilingUsd(
  * Authorized ceiling (USD) for an `extend` call: `max(1, ceil(chunks / CHUNKS_PER_BLOCK))`
  * blocks, times `days / 30`, at the per-block extend price.
  *
- * `chunks` defaults to 0 (-> the 1-block minimum) when the caller doesn't yet know the
- * collection's real size — e.g. call `status()` first for an accurate ceiling on a large
- * collection. This default can never falsely reject an honest quote: the worker's own
- * pre-auth 402 challenge quotes that SAME 1-block basis regardless of the collection's
- * real size (a deliberate choice — revealing the real size to an unauthenticated caller
- * would make extend an existence/size oracle). It only under-authorizes a genuinely
- * multi-block extend, which fails safe (SpendCapError) rather than silently signing more
- * than the caller actually reviewed.
+ * The worker's own pre-auth 402 challenge for extend is DELIBERATELY STATELESS (Task 12's
+ * fix round) — it always quotes the 1-block-per-30-days basis (`days / 30` units) regardless
+ * of the named collection's real chunk count, because reading the real count pre-auth would
+ * make extend an existence/size oracle for an unauthenticated caller. `chunks` defaulting to
+ * 0 here (-> the 1-block minimum) therefore matches that quote EXACTLY in every case, not
+ * merely a safe underestimate of it: the challenge can never quote MORE than this ceiling,
+ * so this function can neither under- nor over-authorize an honest extend call, on a
+ * collection of any real size.
+ *
+ * `chunks` is test-only from the public API's perspective — `extend(collection, days)`
+ * (the brief's pinned 2-arg signature) never passes it, so every production call uses the
+ * default. The parameter exists so `pricing.test.ts` can exercise the general multi-block
+ * formula directly. A future public surface that legitimately knows the real chunk count
+ * (e.g. an options overload) could thread it through, but passing a larger value WIDENS the
+ * authorized ceiling, never tightens it — it must not be reached for on the mistaken belief
+ * that a known chunk count would shrink what a caller authorizes.
  */
 export function extendAuthorizedCeilingUsd(days: number, chunks = 0): number {
   const blocks = Math.max(1, Math.ceil(chunks / CHUNKS_PER_BLOCK));

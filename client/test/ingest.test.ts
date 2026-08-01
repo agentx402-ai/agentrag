@@ -1,7 +1,8 @@
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { describe, expect, it, vi } from "vitest";
-import { AgentRag, SpendCapError } from "../src/index";
+import { AgentRag, RAG_MODELS, SpendCapError } from "../src/index";
 import { ingestAuthorizedCeilingUsd, usdToAtomic } from "../src/pricing";
+import type { RagModelId } from "../src/types";
 
 // Every 200/202 fixture in this file mirrors the REAL wire envelope
 // (`{ data, request_id, usage? }`), not the SDK's own flattened result types — same
@@ -176,6 +177,36 @@ describe("ingest: client-side validation runs BEFORE any request", () => {
     ).rejects.toMatchObject({ code: "invalid_request" });
     expect(fetchImpl).not.toHaveBeenCalled();
   });
+
+  it("an unknown model throws invalid_request with NO request issued", async () => {
+    const fetchImpl = vi.fn();
+    const client = new AgentRag({
+      accountKey: AK,
+      endpoint,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    await expect(
+      client.ingest({
+        documents: [{ text: "hi" }],
+        // @ts-expect-error deliberately invalid model, simulating an untyped caller
+        model: "@cf/not-a-real-model",
+      }),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("RAG_MODELS covers every RagModelId this SDK declares", () => {
+    // Compile-time-checked (RAG_MODELS is declared `satisfies readonly RagModelId[]`) that
+    // every listed id IS a real RagModelId; this asserts the OTHER direction — that the
+    // model-validation allowlist hasn't quietly fallen behind the type union it mirrors.
+    const expected: RagModelId[] = [
+      "@cf/baai/bge-m3",
+      "@cf/baai/bge-large-en-v1.5",
+      "@cf/qwen/qwen3-embedding-0.6b",
+      "@cf/google/embeddinggemma-300m",
+    ];
+    expect([...RAG_MODELS].sort()).toEqual([...expected].sort());
+  });
 });
 
 describe("ingest: happy paths (envelope-wrapped fixtures — see file header)", () => {
@@ -282,7 +313,12 @@ describe("ingest: happy paths (envelope-wrapped fixtures — see file header)", 
     expect(new Headers(calls[0]?.headers).get("Authorization")).toBe(`Bearer ${AK}`);
   });
 
-  it("a job-path ingest (a crawl-root source) resolving 202 returns AskPending", async () => {
+  it("a job-path ingest (a crawl-root source) resolving 202 returns AskPending, WITH usage", async () => {
+    // `usage` on the 202 fixture is load-bearing, not decorative: types.ts documents that
+    // ingest's 202 ALWAYS carries `usage` (unlike ask's, whose 202 precedes its own
+    // pay-on-success charge) — ingest's job path settles the charge BEFORE returning the
+    // 202. A fixture omitting it can't tell a client that forgets to surface `env.usage`
+    // apart from one that never gets a `usage` block on this path at all.
     let sentBody: Record<string, unknown> | undefined;
     const fetchImpl = (async (_u: unknown, init?: RequestInit) => {
       sentBody = JSON.parse(init?.body as string);
@@ -296,7 +332,16 @@ describe("ingest: happy paths (envelope-wrapped fixtures — see file header)", 
               pages_total: 5,
               retry_after: 15,
             },
-            { request_id: "r2" },
+            {
+              usage: {
+                service: "rag",
+                op: "ingest",
+                price_usd: 0.025,
+                list_price_usd: 0.025,
+                credits_charged: 0,
+              },
+              request_id: "r2",
+            },
           ),
         ),
         { status: 202 },
@@ -316,6 +361,11 @@ describe("ingest: happy paths (envelope-wrapped fixtures — see file header)", 
       pages_total: 5,
       retry_after: 15,
       request_id: "r2",
+      usage: {
+        service: "rag",
+        op: "ingest",
+        price_usd: 0.025,
+      },
     });
   });
 });

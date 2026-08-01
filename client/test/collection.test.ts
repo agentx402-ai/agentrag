@@ -1,3 +1,5 @@
+import { chainIdFromCaip2, EIP712_DOMAIN_NAME, EIP712_DOMAIN_VERSION } from "@agentx402-ai/core";
+import { recoverTypedDataAddress } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { describe, expect, it, vi } from "vitest";
 import { AgentRag } from "../src/index";
@@ -5,6 +7,8 @@ import { AgentRag } from "../src/index";
 const endpoint = "https://rag.example";
 const signer = privateKeyToAccount(generatePrivateKey());
 const AK = `ak_${"a".repeat(64)}`;
+const HOST = new URL(endpoint).host;
+const NETWORK = "eip155:8453"; // AgentRag's own DEFAULT_NETWORK
 
 /** A worker-shaped collection-status 200 envelope (free route: no `usage`). */
 function statusEnvelope(data: Record<string, unknown>, requestId = "r-status") {
@@ -13,6 +17,60 @@ function statusEnvelope(data: Record<string, unknown>, requestId = "r-status") {
 
 function errorResponse(code: string, status: number, error = "err"): Response {
   return new Response(JSON.stringify({ error, code }), { status });
+}
+
+// Mirrors core's own (unexported — payment.ts never re-exports it) EIP-712 "Request" typed
+// data shape, reconstructed here so this file can cryptographically RECOVER the signer from
+// a captured signature rather than merely asserting a signature-shaped header exists. This
+// is the mutation-proofing the review asked for: reverting `identityOrBearerHeaders` to a
+// hardcoded `method: "GET"` still produces truthy X-AgentKV-* headers (the prior assertions
+// stayed green under that mutation), but it signs a DIFFERENT message than a real DELETE
+// would — recovering with the EXPECTED method against the ACTUAL signature only yields the
+// signer's own address when the two agree.
+const REQUEST_TYPES = {
+  Request: [
+    { name: "method", type: "string" },
+    { name: "path", type: "string" },
+    { name: "host", type: "string" },
+    { name: "nonce", type: "bytes32" },
+    { name: "timestamp", type: "uint256" },
+  ],
+} as const;
+
+/**
+ * Recovers the address that signed `headers` as an identity (EIP-712 "Request") header set,
+ * reconstructing the typed data with the CALLER-SUPPLIED `method` (not read off the request
+ * — that's the point: an expected method that disagrees with what was actually signed
+ * recovers the WRONG address, not an exception, so the assertion is a plain equality check).
+ */
+async function recoverIdentitySigner(
+  headers: Headers,
+  method: "GET" | "DELETE",
+  path: string,
+): Promise<`0x${string}`> {
+  const nonce = headers.get("X-AgentKV-Nonce");
+  const timestamp = headers.get("X-AgentKV-Timestamp");
+  const signature = headers.get("X-AgentKV-Signature");
+  if (!nonce || !timestamp || !signature) {
+    throw new Error("recoverIdentitySigner: missing identity header(s)");
+  }
+  return recoverTypedDataAddress({
+    domain: {
+      name: EIP712_DOMAIN_NAME,
+      version: EIP712_DOMAIN_VERSION,
+      chainId: chainIdFromCaip2(NETWORK),
+    },
+    types: REQUEST_TYPES,
+    primaryType: "Request",
+    message: {
+      method,
+      path,
+      host: HOST,
+      nonce: nonce as `0x${string}`,
+      timestamp: BigInt(timestamp),
+    },
+    signature: signature as `0x${string}`,
+  });
 }
 
 describe("status(): client-side validation runs BEFORE any request", () => {
@@ -64,6 +122,17 @@ describe("status()", () => {
     expect(seenHeaders?.get("X-AgentKV-Signature")).toBeTruthy();
     expect(seenHeaders?.get("X-AgentKV-Nonce")).toBeTruthy();
     expect(seenHeaders?.get("X-AgentKV-Timestamp")).toBeTruthy();
+    // Cryptographic proof (not just a truthy header): recover the signer from the ACTUAL
+    // signature, reconstructing the message with the EXPECTED method "GET". If the
+    // implementation ever hardcoded (or reverted to) a wrong signed method, this recovers a
+    // different address than `signer.address` — a truthy-header check alone cannot catch
+    // that, since the mutation still emits all three headers.
+    const recovered = await recoverIdentitySigner(
+      seenHeaders as Headers,
+      "GET",
+      "/v1/rag/collection/c1",
+    );
+    expect(recovered.toLowerCase()).toBe(signer.address.toLowerCase());
     expect(result).toMatchObject({
       collection: "c1",
       model: "@cf/baai/bge-m3",
@@ -184,6 +253,15 @@ describe("delete()", () => {
     expect(seenHeaders?.get("X-AgentKV-Signature")).toBeTruthy();
     expect(seenHeaders?.get("X-AgentKV-Nonce")).toBeTruthy();
     expect(seenHeaders?.get("X-AgentKV-Timestamp")).toBeTruthy();
+    // Cryptographic proof, mirroring status()'s own — see that test's comment. Recovering
+    // with the EXPECTED method "DELETE" only yields the signer's address if "DELETE" is
+    // really what got signed, not merely what the caller intended.
+    const recovered = await recoverIdentitySigner(
+      seenHeaders as Headers,
+      "DELETE",
+      "/v1/rag/collection/c1",
+    );
+    expect(recovered.toLowerCase()).toBe(signer.address.toLowerCase());
     expect(result).toEqual({ deleted: true });
   });
 

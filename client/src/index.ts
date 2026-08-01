@@ -56,6 +56,31 @@ export const VERSION = "0.1.0";
  * different model is rejected server-side (model_mismatch). */
 export const DEFAULT_MODEL: RagModelId = "@cf/baai/bge-m3";
 
+/**
+ * The service's own embedding-model catalog, mirrored here as a runtime-checkable array so
+ * `ingest()` can reject an unknown `model` client-side (see its own validation) — the same
+ * M4 rationale as `assertValidSource`/`assertValidDocuments`: a typo'd model id still gets a
+ * clean 400 today, but rejecting it before any request avoids burning a real EIP-3009
+ * signature in wallet mode on a request the worker was always going to refuse.
+ *
+ * Unlike `ask()`'s `mode` enum, this is NOT a stale-allowlist risk: the worker's model table
+ * is a hardcoded compile-time record keyed by exactly these four ids, and each entry pins a
+ * fixed embedding dimension plus a specific Vectorize index binding — a fifth model requires
+ * a worker code change, a deploy, and (for a new dimension) a new index, never a silent
+ * server-side addition the SDK could fall behind on unnoticed. `satisfies readonly
+ * RagModelId[]` is a compile-time check that every entry here is a real `RagModelId` (catches
+ * a typo at build time, before it ever reaches a runtime check). Task 14 (cross-repo parity)
+ * should compare this array against the worker's own model catalog keys, the same
+ * "duplicated by contract, cross-checked by CI" pattern already used for every other
+ * price/limit this SDK mirrors.
+ */
+export const RAG_MODELS = [
+  "@cf/baai/bge-m3",
+  "@cf/baai/bge-large-en-v1.5",
+  "@cf/qwen/qwen3-embedding-0.6b",
+  "@cf/google/embeddinggemma-300m",
+] as const satisfies readonly RagModelId[];
+
 // Pinned prices (USD) — parity-guarded against the worker's own price registry by a
 // cross-repo CI check. The wire price always comes from the server's 402 challenge;
 // these are used only for client-side pre-request authorized-ceiling math (pricing.ts).
@@ -831,12 +856,17 @@ export class AgentRag {
         );
       }
     }
-    // `model`, if present, is forwarded UNVALIDATED (unlike ask()'s `mode` enum check):
-    // deliberately not mirrored client-side — the worker's own model catalog is expected
-    // to grow over time (unlike the small, stable ask `mode` enum), so a hardcoded client
-    // allowlist would go stale and start rejecting valid new models. A bad model id still
-    // gets a clean 400 from the server; the worse-outcome failure mode (silently rejecting
-    // a model the caller can genuinely use) is the one worth avoiding here.
+    // Mirrors ask()'s `mode` enum check (see RAG_MODELS's own doc comment for why this,
+    // unlike that enum, carries no stale-allowlist risk: the worker's model catalog can't
+    // drift ahead of a coordinated SDK release either).
+    if (opts.model !== undefined && !RAG_MODELS.includes(opts.model)) {
+      throw new AgentRagError(
+        `model must be one of ${RAG_MODELS.join(", ")} (got ${JSON.stringify(opts.model)}); ` +
+          "omit model to inherit the target collection's own",
+        "invalid_request",
+        0,
+      );
+    }
 
     const body: Record<string, unknown> = {};
     if (opts.sources !== undefined) body.sources = opts.sources;
@@ -887,10 +917,12 @@ export class AgentRag {
   /**
    * Push a named collection's `expires_at` out by `days` (30/60/90) without querying it
    * first. Paid per call: `ceil(chunks / CHUNKS_PER_BLOCK)` blocks (min 1) times
-   * `days / 30`, at the per-block extend price — `extendAuthorizedCeilingUsd` prices the
-   * WORST case (the 1-block minimum) from `days` alone, since the real chunk count isn't
-   * knowable client-side without an extra round-trip (call `status()` first for a tighter
-   * ceiling on a large collection; see extendAuthorizedCeilingUsd's own doc comment).
+   * `days / 30`, at the per-block extend price. `extendAuthorizedCeilingUsd(days)` (its
+   * `chunks` defaulted, since this method takes no such argument) authorizes exactly the
+   * worker's own stateless 1-block-per-30-days quote — see that function's own doc comment
+   * for why this is an EXACT match on a collection of any real size, never merely a safe
+   * underestimate: the worker's pre-auth 402 challenge never reveals or depends on the
+   * collection's real chunk count, by design.
    */
   async extend(collection: string, days: 30 | 60 | 90): Promise<ExtendResult> {
     assertValidCollectionName(collection);

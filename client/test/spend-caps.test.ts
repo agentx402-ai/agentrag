@@ -1,7 +1,12 @@
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { describe, expect, it } from "vitest";
 import { AgentRag, SpendCapError } from "../src/index";
-import { askAuthorizedCeilingUsd } from "../src/pricing";
+import {
+  askAuthorizedCeilingUsd,
+  extendAuthorizedCeilingUsd,
+  ingestAuthorizedCeilingUsd,
+  usdToAtomic,
+} from "../src/pricing";
 
 const endpoint = "https://rag.example";
 const signer = privateKeyToAccount(generatePrivateKey());
@@ -9,7 +14,7 @@ const signer = privateKeyToAccount(generatePrivateKey());
 // constant) so this suite also exercises pricing.ts, not just the ledger/ceiling wiring.
 const ASK_CEILING = askAuthorizedCeilingUsd(undefined, 20);
 
-function challenge(amount: string): string {
+function challenge(amount: string, resource = "/v1/rag/ask"): string {
   return btoa(
     JSON.stringify({
       x402Version: 2,
@@ -20,8 +25,8 @@ function challenge(amount: string): string {
           amount,
           asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
           payTo: "0x0000000000000000000000000000000000000001",
-          resource: "/v1/rag/ask",
-          description: "ask",
+          resource,
+          description: resource,
           mimeType: "application/json",
           maxTimeoutSeconds: 300,
         },
@@ -30,10 +35,15 @@ function challenge(amount: string): string {
   );
 }
 
-// No ask()/ingest()/extend() exist yet, so tests drive performOp directly with an
-// ask-shaped spec — exactly what a future `ask()` will hand it (same authorizedCeilingUsd
-// formula, same Idempotency-Key discipline). Named `syntheticAsk`, not `ask`, so it never
-// collides with the real verb method a later task adds to AgentRag itself.
+// `ask()`/`ingest()`/`extend()` now exist (Tasks 5-6), but these performOp-level tests
+// predate them and stay in this shape deliberately: they drive `performOp` directly with an
+// ask-shaped spec through a synthetic subclass, so they keep covering the shared
+// ceiling/reservation/release mechanism generically, independent of any one verb's own
+// request/response shape. Named `syntheticAsk`, not `ask`, so it never collides with the
+// real verb method on `AgentRag` itself. The "spend recording via the real verbs" describe
+// block below this class additionally drives `ingest()`/`extend()` themselves, closing the
+// coverage gap this comment used to describe honestly ("No ask()/ingest()/extend() exist
+// yet") but no longer does.
 class TestClient extends AgentRag {
   syntheticAsk(
     idempotencyKey: string,
@@ -341,5 +351,121 @@ describe("spend caps", () => {
     const p = new Probe({ signer, endpoint });
     expect(() => p.opCeiling(Number.NaN)).toThrow(SpendCapError);
     expect(() => p.opCeiling(0.008)).not.toThrow();
+  });
+});
+
+// Review fix round 1 (Important #3): the tests above prove `performOp`'s ceiling/reservation
+// mechanism generically, through a synthetic spec — but nothing exercised `recordSpend`
+// through the REAL `ingest()`/`extend()` call sites, including ingest's 202 (its job path
+// settles the charge BEFORE returning the 202 — see ingest.ts's own module doc — so
+// `Response.ok` being true for a 202 is what makes `if (res.ok) this.recordSpend(usd)`
+// correct there, unlike ask()'s 202, which precedes its own pay-on-success charge). A
+// regression narrowing that condition (e.g. to `res.status === 200`) would silently stop
+// counting every job-path ingest against `maxSessionSpendUsd` and the suite would stay
+// green without this coverage.
+//
+// Same technique as the "second identical call is capped" tests above: set
+// maxSessionSpendUsd to fit exactly ONE op's price, prove the first succeeds, then prove an
+// IDENTICAL second call is refused at the cap — that refusal is only possible if the first
+// call's settled amount actually moved the session counter.
+describe("ingest()/extend(): spend recording via the real verbs", () => {
+  it("ingest(): a 202 (job path) op moves the session counter — an identical second call is capped", async () => {
+    const sources = ["https://a.com/**"]; // crawl root -> job path, resolves 202
+    const maxPages = 20;
+    const ceiling = ingestAuthorizedCeilingUsd(sources, 0, maxPages);
+    let sigCount = 0;
+    let i = 0;
+    const responses: Array<() => Response> = [
+      () =>
+        new Response("{}", {
+          status: 402,
+          headers: {
+            "PAYMENT-REQUIRED": challenge(String(usdToAtomic(ceiling)), "/v1/rag/ingest"),
+          },
+        }),
+      () =>
+        new Response(
+          JSON.stringify({
+            data: {
+              collection: "c1",
+              status: "ingesting",
+              pages_done: 0,
+              pages_total: maxPages,
+              retry_after: 15,
+            },
+          }),
+          { status: 202 },
+        ),
+      () =>
+        new Response("{}", {
+          status: 402,
+          headers: {
+            "PAYMENT-REQUIRED": challenge(String(usdToAtomic(ceiling)), "/v1/rag/ingest"),
+          },
+        }),
+    ];
+    const fetchImpl = (async (_u: unknown, init?: RequestInit) => {
+      if (init && new Headers(init.headers).get("PAYMENT-SIGNATURE")) sigCount++;
+      return responses[Math.min(i++, responses.length - 1)]();
+    }) as unknown as typeof fetch;
+    const client = new AgentRag({
+      signer,
+      endpoint,
+      fetchImpl,
+      // Room for exactly one op's settled amount, not two.
+      maxSessionSpendUsd: ceiling * 1.5,
+    });
+
+    const first = await client.ingest({ sources, maxPages });
+    expect(first).toMatchObject({ status: "ingesting" });
+    await expect(client.ingest({ sources, maxPages })).rejects.toBeInstanceOf(SpendCapError);
+    // Only the first call ever signed — the second stopped at the session cap, proving the
+    // first call's 202 genuinely recorded its spend (a stale/zero counter would let both
+    // calls sign).
+    expect(sigCount).toBe(1);
+  });
+
+  it("extend(): a 200 op moves the session counter — an identical second call is capped", async () => {
+    const ceiling = extendAuthorizedCeilingUsd(30);
+    let sigCount = 0;
+    let i = 0;
+    const responses: Array<() => Response> = [
+      () =>
+        new Response("{}", {
+          status: 402,
+          headers: {
+            "PAYMENT-REQUIRED": challenge(String(usdToAtomic(ceiling)), "/v1/rag/extend"),
+          },
+        }),
+      () =>
+        new Response(
+          JSON.stringify({
+            data: { collection: "c1", expires_at: "2026-10-01T00:00:00.000Z" },
+          }),
+          { status: 200 },
+        ),
+      () =>
+        new Response("{}", {
+          status: 402,
+          headers: {
+            "PAYMENT-REQUIRED": challenge(String(usdToAtomic(ceiling)), "/v1/rag/extend"),
+          },
+        }),
+    ];
+    const fetchImpl = (async (_u: unknown, init?: RequestInit) => {
+      if (init && new Headers(init.headers).get("PAYMENT-SIGNATURE")) sigCount++;
+      return responses[Math.min(i++, responses.length - 1)]();
+    }) as unknown as typeof fetch;
+    const client = new AgentRag({
+      signer,
+      endpoint,
+      fetchImpl,
+      maxSessionSpendUsd: ceiling * 1.5,
+    });
+
+    const first = await client.extend("c1", 30);
+    expect(first.collection).toBe("c1");
+    await expect(client.extend("c1", 30)).rejects.toBeInstanceOf(SpendCapError);
+    expect(sigCount).toBe(1);
   });
 });
