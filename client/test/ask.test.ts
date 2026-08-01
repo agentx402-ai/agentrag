@@ -4,11 +4,10 @@ import { AgentRag, AgentRagError, SpendCapError } from "../src/index";
 import { askAuthorizedCeilingUsd } from "../src/pricing";
 
 // Every 200/202 fixture in this file mirrors the REAL wire envelope
-// (`the service's HTTP envelope helper`'s `dataResponse`: `{ data, request_id, usage? }`),
-// not the SDK's own flattened result types — verified against the worker's own
-// `ask-route.test.ts`, which asserts `body.data.*` throughout. A fixture written from
-// `AskResult`'s shape instead of the wire shape is exactly the blind spot that let a
-// broken production path pass 97/97 tests in the prior round.
+// (`{ data, request_id, usage? }`), not the SDK's own flattened result types — verified
+// against the worker's own test suite, which asserts `body.data.*` throughout. A fixture
+// written from `AskResult`'s shape instead of the wire shape is exactly the blind spot
+// that let a broken production path pass 97/97 tests in the prior round.
 
 const endpoint = "https://rag.example";
 const signer = privateKeyToAccount(generatePrivateKey());
@@ -552,6 +551,135 @@ describe("askAndWait", () => {
     const reAskBody = JSON.parse(calls[3].body ?? "{}");
     expect(reAskBody.collection).toBe("c1");
     expect(reAskBody.sources).toBeUndefined();
+  });
+
+  /** Drives the same ask -> 202 -> poll(running) -> poll(complete) -> re-ask sequence as
+   * the happy-path test above, but records the `Idempotency-Key` header on every call so
+   * these tests can assert on it (I2). */
+  function scriptedFourStepFlow(calls: Array<{ method: string; idempotencyKey: string | null }>) {
+    let step = 0;
+    return (async (input: unknown, init?: RequestInit) => {
+      const method = init?.method ?? "GET";
+      calls.push({
+        method,
+        idempotencyKey: init ? new Headers(init.headers).get("Idempotency-Key") : null,
+      });
+      void input;
+      step++;
+      if (step === 1) {
+        return new Response(
+          JSON.stringify(
+            askEnvelope({
+              collection: "c1",
+              status: "ingesting",
+              pages_done: 0,
+              pages_total: 1,
+              retry_after: 0,
+            }),
+          ),
+          { status: 202 },
+        );
+      }
+      if (step === 2) {
+        return new Response(
+          JSON.stringify(
+            statusEnvelope({
+              collection: "c1",
+              model: "@cf/baai/bge-m3",
+              pages: 0,
+              chunks: 0,
+              created_at: "2026-08-01T00:00:00.000Z",
+              expires_at: "2026-09-01T00:00:00.000Z",
+              job: { pages_done: 0, pages_total: 1, state: "running" },
+            }),
+          ),
+          { status: 200 },
+        );
+      }
+      if (step === 3) {
+        return new Response(
+          JSON.stringify(
+            statusEnvelope({
+              collection: "c1",
+              model: "@cf/baai/bge-m3",
+              pages: 1,
+              chunks: 4,
+              created_at: "2026-08-01T00:00:00.000Z",
+              expires_at: "2026-09-01T00:00:00.000Z",
+              job: { pages_done: 1, pages_total: 1, state: "complete" },
+            }),
+          ),
+          { status: 200 },
+        );
+      }
+      return new Response(
+        JSON.stringify(
+          askEnvelope({
+            collection: "c1",
+            expires_at: "2026-09-01T00:00:00.000Z",
+            matched: true,
+            chunks: [],
+          }),
+        ),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+  }
+
+  it("I2: the re-ask derives `<callerKey>:ask` from a caller-supplied idempotencyKey", async () => {
+    const calls: Array<{ method: string; idempotencyKey: string | null }> = [];
+    const client = new AgentRag({
+      accountKey: AK,
+      endpoint,
+      fetchImpl: scriptedFourStepFlow(calls),
+    });
+
+    await client.askAndWait("what is x", {
+      sources: ["https://a.com"],
+      idempotencyKey: "caller-key",
+      pollIntervalMs: 0,
+      maxWaitMs: 5_000,
+    });
+
+    expect(calls).toHaveLength(4);
+    // The initial ask keeps the caller's own key verbatim (unaffected by this fix).
+    expect(calls[0]).toMatchObject({
+      method: "POST",
+      idempotencyKey: "caller-key",
+    });
+    // The re-ask (the billing leg) gets a key DERIVED from the caller's — extending
+    // their exactly-once guarantee to the leg that actually settles a charge, without
+    // reusing the exact string (which would re-derive the first leg's already-used
+    // EIP-3009 nonce in wallet mode — see askAndWait's doc comment).
+    expect(calls[3]).toMatchObject({
+      method: "POST",
+      idempotencyKey: "caller-key:ask",
+    });
+  });
+
+  it("I2: the re-ask still gets a fresh idempotency key when the caller supplied none", async () => {
+    const calls: Array<{ method: string; idempotencyKey: string | null }> = [];
+    const client = new AgentRag({
+      accountKey: AK,
+      endpoint,
+      fetchImpl: scriptedFourStepFlow(calls),
+    });
+
+    await client.askAndWait("what is x", {
+      sources: ["https://a.com"],
+      pollIntervalMs: 0,
+      maxWaitMs: 5_000,
+    });
+
+    expect(calls).toHaveLength(4);
+    const initialKey = calls[0]?.idempotencyKey;
+    const reAskKey = calls[3]?.idempotencyKey;
+    expect(initialKey).toBeTruthy();
+    expect(reAskKey).toBeTruthy();
+    // Both are fresh, independently-generated nonces — never a fixed "undefined:ask"
+    // string, and never the same value reused across the two logical operations.
+    expect(reAskKey).not.toBe(initialKey);
+    expect(reAskKey).not.toContain(":ask");
   });
 
   it("throws ingest_timeout once maxWaitMs elapses while the job keeps reporting 'running'", async () => {

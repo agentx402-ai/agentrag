@@ -80,11 +80,11 @@ export const DEFAULT_ASK_WAIT_MS = 120_000;
 export const DEFAULT_ASK_POLL_INTERVAL_MS = 15_000;
 
 const DEFAULT_NETWORK = "eip155:8453";
-// Mirrors the worker's own `mode` enum (routes/ask.ts's parseAskBody).
+// Mirrors the worker's own `mode` enum.
 const ASK_MODES = ["hybrid", "dense", "bm25"] as const;
-// Mirrors the worker's own `max_pages` default (routes/ask.ts's parseAskBody) — used ONLY
-// to size the authorized-ceiling formula when the caller omits `maxPages`; the wire
-// request itself omits `max_pages` too in that case, so the worker applies this same default.
+// Mirrors the worker's own `max_pages` default — used ONLY to size the authorized-ceiling
+// formula when the caller omits `maxPages`; the wire request itself omits `max_pages` too
+// in that case, so the worker applies this same default.
 const DEFAULT_ASK_MAX_PAGES = 20;
 
 /**
@@ -108,8 +108,8 @@ function assertFiniteUsd(value: unknown, label: string): void {
 }
 
 /**
- * Mirrors the worker's own source-grammar validation (ingest/sources.ts's `resolveOne`) so
- * a malformed source is rejected client-side before any request: an exact http(s) URL, or
+ * Mirrors the worker's own source-grammar validation so a malformed source is rejected
+ * client-side before any request: an exact http(s) URL, or
  * a URL whose path ends with the literal trailing segment "/**" (a same-origin crawl
  * root). "**" is grammar ONLY as a whole trailing segment — anywhere else is rejected with
  * a precise reason instead of a generic parse failure.
@@ -147,6 +147,24 @@ function assertValidSource(entry: string): void {
 function isAskPending(result: AskResult | AskPending): result is AskPending {
   return (result as AskPending).status === "ingesting";
 }
+
+/**
+ * The verb-specific half of a paid response's envelope (the service's own wire contract
+ * wraps every success body as `{ data, request_id, usage? }`; this is `data`'s shape).
+ * A plain `Omit<T, K>` does NOT distribute over a union: `keyof (A | B)` is the
+ * INTERSECTION of `keyof A` and `keyof B` (TypeScript can only guarantee a property exists
+ * on a union-typed value if every member has it), so `Omit<AskResult | AskPending, K>`
+ * collapses to just the few keys the two interfaces happen to share after removing `K` —
+ * here, only `collection` — silently discarding `chunks`/`matched`/`expires_at` (AskResult)
+ * and `status`/`pages_done`/`pages_total`/`retry_after` (AskPending) from the type. The
+ * `T extends unknown ? ... : never` form below IS a distributive conditional type (a naked
+ * type parameter in a conditional distributes), so `DataOf<AskResult | AskPending>`
+ * correctly evaluates to `Omit<AskResult, K> | Omit<AskPending, K>` — a proper union
+ * retaining each branch's own fields.
+ */
+type DataOf<T> = T extends unknown
+  ? Omit<T, "usage" | "request_id" | "settledTxHash" | "creditsRemaining">
+  : never;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -562,32 +580,28 @@ export class AgentRag {
         body: JSON.stringify(body),
       }),
       parseSuccess: async (res) => {
-        // C1 fix: the worker wraps every success body in `{ data, request_id, usage? }`
-        // (`dataResponse`, the service's HTTP envelope helper) — `data` carries the
-        // verb-specific fields (AskResult's or AskPending's own shape), `usage` and
-        // `request_id` are envelope-level siblings, NOT nested inside `data`. Parsing
-        // this flat (as the prior round did) leaves every `data`-half field
-        // `undefined` at runtime despite typechecking fine against AskResult/AskPending.
+        // C1 fix: the service wraps every success body in `{ data, request_id, usage? }`
+        // — `data` carries the verb-specific fields (AskResult's or AskPending's own
+        // shape), `usage` and `request_id` are envelope-level siblings, NOT nested
+        // inside `data`. Parsing this flat (as an earlier round did) leaves every
+        // `data`-half field `undefined` at runtime despite typechecking fine against
+        // AskResult/AskPending. `data: DataOf<AskResult | AskPending>` (not a bare
+        // `Omit<AskResult | AskPending, ...>`, which does not distribute over the
+        // union — see DataOf's own doc comment) keeps the compiler checking this
+        // spread for real, so a future edit back to an unwrapped `...env` is a type
+        // error, not merely a fixture failure.
         const env = JSON.parse(await res.text()) as {
-          data: Omit<
-            AskResult | AskPending,
-            "usage" | "request_id" | "settledTxHash" | "creditsRemaining"
-          >;
+          data: DataOf<AskResult | AskPending>;
           usage?: AskResult["usage"];
           request_id?: string;
         };
-        // Cast needed: TS spreads a UNION-typed value conservatively, keeping only
-        // properties common to EVERY union member (here just `collection`) as certain
-        // — it does not re-verify the result against AskResult | AskPending on its
-        // own. The shape is already pinned by `env`'s own type assertion above; this
-        // cast just carries that same trust through the spread, not a new one.
         return {
           ...env.data,
           usage: env.usage,
           request_id: env.request_id,
           settledTxHash: settledTxHash(res),
           creditsRemaining: creditsRemaining(res),
-        } as AskResult | AskPending;
+        };
       },
     });
   }
@@ -597,9 +611,19 @@ export class AgentRag {
    * this collection's ingest-job state until it leaves `running`, then re-asks against
    * the now-resolved collection directly — dropping `sources`/`maxPages`/`refresh` on
    * the retry, since re-sending them would re-quote (and, in wallet mode, re-sign) a
-   * full composite ingest charge for work that is already done. A fresh idempotency key
-   * is used for the retry too (never the original ask's), since it is a structurally
-   * different request body — reusing the same key risks `idempotency_conflict`.
+   * full composite ingest charge for work that is already done.
+   *
+   * I2: the re-ask's idempotency key is DERIVED from the caller's own (`${key}:ask`),
+   * not reused verbatim and not dropped. The real constraint reusing it verbatim would
+   * hit is nonce collision, not `idempotency_conflict` (a wrong claim an earlier version
+   * of this comment made): in wallet mode, `nonceFromIdempotencyKey` deterministically
+   * derives the signed EIP-3009 authorization's nonce FROM the idempotency key, so
+   * presenting the SAME key again would sign with the SAME nonce as the original ask's
+   * own payment — a nonce already marked used server-side the moment that payment
+   * settled. Deriving a distinct-but-stable key instead means a caller who supplies
+   * their OWN `idempotencyKey` gets exactly-once coverage on the leg that actually
+   * bills (the re-ask), not only on the initial, possibly-still-pending call — while a
+   * caller who supplies none still gets a fresh nonce per call, unchanged.
    *
    * Throws `ingest_timeout` at `maxWaitMs` (default `DEFAULT_ASK_WAIT_MS`); the job
    * itself keeps running server-side regardless — a timeout here loses patience, not the
@@ -637,6 +661,11 @@ export class AgentRag {
       );
     }
     const deadline = Date.now() + (maxWaitMs ?? DEFAULT_ASK_WAIT_MS);
+    // I2: computed once, outside the loop — askOpts.idempotencyKey doesn't change across
+    // iterations. `undefined` (not a derived string) when the caller supplied none, so
+    // the re-ask falls through to ask()'s own `?? freshNonce()` exactly as before.
+    const reAskIdempotencyKey =
+      askOpts.idempotencyKey !== undefined ? `${askOpts.idempotencyKey}:ask` : undefined;
 
     let result = await this.ask(query, askOpts);
     while (isAskPending(result)) {
@@ -664,11 +693,13 @@ export class AgentRag {
 
       // Ingest is no longer running (complete or failed) -> re-ask the resolved
       // collection directly. Only retrieval knobs carry over; sources/maxPages/refresh
-      // are ingest-only and idempotencyKey must be fresh (see doc comment above).
+      // are ingest-only. I2: idempotencyKey is DERIVED (see doc comment above), not
+      // reused verbatim and not dropped — see reAskIdempotencyKey's own comment.
       result = await this.ask(query, {
         collection,
         topK: askOpts.topK,
         mode: askOpts.mode,
+        idempotencyKey: reAskIdempotencyKey,
       });
     }
     return result;
@@ -718,11 +749,10 @@ export class AgentRag {
       headers: await this.pollHeaders(path),
     }));
     if (!res.ok) throw await this.asError(res, "collection status failed");
-    // C2 fix: this route's success body is ALSO the `{ data, request_id }` envelope
-    // (`routeCollectionStatus` returns `dataResponse(200, statusData(meta), requestId)`,
-    // and `statusData` nests `job` inside its own `data` half) — `body.job` is always
-    // `undefined`. The prior round's bug: `askAndWait` treats `undefined` as terminal,
-    // so it exited the wait after exactly one poll regardless of the job's real state.
+    // C2 fix: this route's success body is ALSO the `{ data, request_id }` envelope, and
+    // `job` is nested inside its `data` half — `body.job` is always `undefined`. The
+    // prior round's bug: `askAndWait` treats `undefined` as terminal, so it exited the
+    // wait after exactly one poll regardless of the job's real state.
     const body = (await res.json()) as {
       data?: { job?: { state: "running" | "complete" | "failed" } };
     };
