@@ -91,8 +91,14 @@ function tools(client: McpClient, wallet: WalletIdentity = WALLET) {
   return (server as any)._registeredTools as Record<
     string,
     {
+      description?: string;
       annotations?: Record<string, unknown>;
-      inputSchema: { safeParse: (v: unknown) => { success: boolean } };
+      // `data?: unknown` on the success branch mirrors zod's own SafeParseSuccess shape closely
+      // enough that callers can read `.data` directly — widened here (review fix round 2) so the
+      // refresh-stripping test below no longer needs an `as unknown as {...}` cast to reach it.
+      inputSchema: {
+        safeParse: (v: unknown) => { success: boolean; data?: unknown };
+      };
       handler: (a: unknown, e: unknown) => Promise<unknown>;
     }
   >;
@@ -233,9 +239,12 @@ describe("agentrag mcp tools", () => {
   // never accepted — a model reading the description would set `refresh:true` expecting a
   // forced re-fetch, get a confident 200 computed from the stale index, and be billed for it,
   // with nothing reporting the flag was dropped. The description is now corrected to say rag_ask
-  // has no refresh option; these two tests pin that the CODE actually matches that claim, so a
-  // future change that starts wiring `refresh` through without also updating the description (or
-  // vice versa) is caught.
+  // has no refresh option; these three tests pin that the CODE actually matches that claim (the
+  // first two — a future change that starts wiring `refresh` through without also updating the
+  // description is caught) AND that the DESCRIPTION stays honest independently of the code (the
+  // third — review fix round 2: this comment used to claim "or vice versa" here, but nothing
+  // tested it, and the review reintroduced the original false claim in the description while
+  // leaving the schema/handler untouched and got a fully green suite).
   it("rag_ask's schema has no refresh field — an extra refresh:true is stripped from the parsed input", () => {
     const t = tools(fakeClient());
     const result = t.rag_ask.inputSchema.safeParse({
@@ -244,9 +253,17 @@ describe("agentrag mcp tools", () => {
       refresh: true,
     });
     expect(result.success).toBe(true);
-    expect((result as unknown as { data: Record<string, unknown> }).data).not.toHaveProperty(
-      "refresh",
-    );
+    expect(result.data).not.toHaveProperty("refresh");
+  });
+
+  it("rag_ask's description is honest that it has no refresh option", () => {
+    const t = tools(fakeClient());
+    // Positive: the disclaimer this fix round added is present — pinned so it can't be
+    // silently deleted or reworded away.
+    expect(t.rag_ask.description).toContain("no `refresh` option");
+    // Negative: the exact phrasing the ORIGINAL bug used (implying rag_ask itself honors a
+    // refresh flag) is not present — catches a revert back toward that specific false claim.
+    expect(t.rag_ask.description).not.toMatch(/or `refresh` is set/i);
   });
 
   it("rag_ask never forwards refresh to client.ask, even when the caller passes one", async () => {
