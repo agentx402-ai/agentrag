@@ -88,6 +88,18 @@ describe("plugin manifests agree", () => {
       .map(([name]) => name);
     expect(unmarked).toEqual([]);
   });
+
+  // The pattern rule above only fires for a NAME that looks secret-shaped — a credential field
+  // named to dodge the pattern (e.g. "wallet_credential") would carry no sensitive flag at all
+  // and pass every check above. Require every field to declare `sensitive` explicitly (true or
+  // false, never inferred/omitted), so a forgotten declaration fails regardless of naming — this
+  // makes declaring it a mandatory authoring step, not something a name pattern has to guess at.
+  it("every userConfig field declares `sensitive` explicitly, present and boolean (never inferred from naming)", () => {
+    const undeclared = Object.entries(plugin.userConfig)
+      .filter(([, def]) => typeof (def as { sensitive?: unknown }).sensitive !== "boolean")
+      .map(([name]) => name);
+    expect(undeclared).toEqual([]);
+  });
 });
 
 // The suite above only proves each "${user_config.X}" REFERENCE resolves to a declared
