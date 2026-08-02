@@ -47,20 +47,22 @@ export function buildMcpServer(deps: { client: McpClient; wallet: WalletIdentity
   server.tool(
     "rag_ask",
     "Ask a question over your documents (hybrid BM25 + vector retrieval). If `sources` names " +
-      "URLs the target collection hasn't indexed yet (or `refresh` is set), this also ingests " +
-      "them first, on demand. SPENDS real USDC (x402 wallet mode) or credits (account-key mode); " +
-      "honors maxSpendUsd/maxSessionSpendUsd. Flat $0.008/ask when no ingest is needed; an " +
-      "on-demand ingest leg adds per-page pricing on top. A needed ingest that takes a while " +
-      "resolves as a pending status (not an error) — set `wait:true` to block until it " +
-      "finishes and get the real answer back in one call.",
+      "URLs the target collection hasn't indexed yet, this also ingests them first, on demand " +
+      "(this tool has no `refresh` option — to force re-fetching an already-indexed source, " +
+      "call rag_ingest with refresh:true first). SPENDS real USDC (x402 wallet mode) or credits " +
+      "(account-key mode); honors maxSpendUsd/maxSessionSpendUsd. Flat $0.008/ask when no " +
+      "ingest is needed; an on-demand ingest leg adds per-page pricing on top. A needed ingest " +
+      "that takes a while resolves as a pending status (not an error) — set `wait:true` to " +
+      "block until it finishes and get the real answer back in one call.",
     {
       query: z.string().describe("The question to ask"),
       sources: z
         .array(z.string().url())
         .optional()
         .describe(
-          "Sources to ingest before answering, if the target collection doesn't exist yet or " +
-            "`refresh` is set. Each an exact http(s) URL or a trailing '/**' same-origin crawl root.",
+          "Sources to ingest before answering, if the target collection doesn't exist yet. " +
+            "Each an exact http(s) URL or a trailing '/**' same-origin crawl root. To force " +
+            "re-ingesting an already-indexed source, use rag_ingest with refresh:true instead.",
         ),
       collection: z
         .string()
@@ -240,10 +242,25 @@ export function buildMcpServer(deps: { client: McpClient; wallet: WalletIdentity
   return server;
 }
 
-export async function startMcp(deps: {
-  env: NodeJS.ProcessEnv;
-  stderr: (s: string) => void;
-}): Promise<number> {
+/**
+ * Everything `startMcp` does BEFORE touching stdio: resolve config, warn on stderr if unbounded,
+ * build the client, resolve the wallet identity, and scrub the sensitive env — in that exact
+ * load-bearing order (see `startMcp`'s own doc comment for why). Split out from `startMcp` so a
+ * test can drive this half directly and assert the scrub genuinely ran against the given `env`
+ * object, without going through a real `StdioServerTransport.connect()` — which spawns a real
+ * read loop against THIS process's actual stdin/stdout and would corrupt the test runner's own
+ * I/O, not just the imagined MCP server's.
+ *
+ * Review fix round 1 (Important #3): before this split, `scrubSensitiveEnv(deps.env)` in
+ * `startMcp` had no direct coverage — deleting that one call site left the full suite green,
+ * because every test that exercised `startMcp` end to end had to go through the built binary
+ * (which can't safely be re-run per line of setup), and every test of `scrubSensitiveEnv` itself
+ * called the function directly rather than through `startMcp`'s own call site.
+ */
+export function prepareMcp(deps: { env: NodeJS.ProcessEnv; stderr: (s: string) => void }): {
+  server: McpServer;
+  wallet: WalletIdentity;
+} {
   const cfg = resolveConfig({}, deps.env, () => readConfigFile(deps.env));
   // Visibility, not a default cap: an MCP server lives for a whole session and every paid verb
   // spends, so without a cumulative bound the total is unbounded no matter what the per-op cap
@@ -267,6 +284,14 @@ export async function startMcp(deps: {
   const wallet = resolveWalletIdentity(deps.env, accountMode);
   scrubSensitiveEnv(deps.env);
   const server = buildMcpServer({ client, wallet });
+  return { server, wallet };
+}
+
+export async function startMcp(deps: {
+  env: NodeJS.ProcessEnv;
+  stderr: (s: string) => void;
+}): Promise<number> {
+  const { server } = prepareMcp(deps);
   const transport = new StdioServerTransport();
   await server.connect(transport);
   // Keep the process alive until the MCP session genuinely closes. Authoritative signal: the

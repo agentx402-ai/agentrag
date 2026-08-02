@@ -59,6 +59,21 @@ afterAll(async () => {
   await new Promise<void>((resolve) => httpServer.close(() => resolve()));
 });
 
+/** True iff a process with this pid is still signalable (ESRCH means it's gone). Cross-platform
+ * per Node's own docs: `process.kill(pid, 0)` tests existence without sending a real signal. */
+function pidIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 describe("MCP server lifecycle", () => {
   it("stays alive, lists the 6 rag tools, reports VERSION, and serves a live rag_status", async () => {
     const home = mkdtempSync(join(tmpdir(), "agentrag-mcp-"));
@@ -73,7 +88,15 @@ describe("MCP server lifecycle", () => {
         AGENTRAG_NETWORK: "eip155:8453",
       },
     });
+    // Review fix round 1 (Important #2): stdout purity was previously observable ONLY at
+    // startup (the sole test wiring onerror never calls a tool; the sole test that calls a tool
+    // never wired onerror) — a stray console.log/process.stdout.write inside a TOOL HANDLER
+    // corrupted the JSON-RPC channel with the full suite green. Wiring onerror here, in the test
+    // that actually round-trips rag_status, closes that gap.
+    const errors: unknown[] = [];
+    transport.onerror = (e) => errors.push(e);
     const client = new Client({ name: "test-client", version: "0.0.1" });
+    client.onerror = (e) => errors.push(e);
     try {
       await client.connect(transport);
 
@@ -112,6 +135,28 @@ describe("MCP server lifecycle", () => {
       const parsed = JSON.parse(content[0].text);
       expect(parsed.collection).toBe("docs");
       expect(parsed.chunks).toBe(3);
+
+      // Review fix round 1 (Important #2, cont'd): assert AFTER the tool call, not just after
+      // startup — this is the assertion a handler-level stdout write needs to fail.
+      expect(errors).toHaveLength(0);
+
+      // Review fix round 1 (Important #5): the file's own header comment claims this test
+      // "verifies the server stays alive ... and does NOT exit immediately after connect", but
+      // nothing checked that beyond the calls above succeeding. Earn the claim: confirm the
+      // child process is still signalable after an idle beat, then prove it is genuinely still
+      // SERVING (not merely not-yet-reaped) with a second round-trip call.
+      const pid = transport.pid;
+      expect(pid).not.toBeNull();
+      expect(pidIsAlive(pid as number)).toBe(true);
+      await sleep(300);
+      expect(pidIsAlive(pid as number)).toBe(true);
+      const second = await client.callTool({
+        name: "rag_status",
+        arguments: { collection: "docs" },
+      });
+      expect(JSON.parse((second.content as Array<{ text: string }>)[0].text).collection).toBe(
+        "docs",
+      );
     } finally {
       await client.close();
       rmSync(home, { recursive: true, force: true });
