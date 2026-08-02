@@ -23,6 +23,18 @@ The CI `versions` job cross-checks all **six in-repo** sources AND the cli→cli
 range (`cli/package.json`'s `@agentrag/client` must be `^<clientVersion>`); it fails if any
 diverge. The seventh (marketplace) pin lives in another repo and is synced automatically on release.
 
+All six in-repo sources are checked at **three call sites**, deliberately not one shared
+implementation: `ci.yml`'s `versions` job and `publish.yml`'s `build` job both invoke
+`scripts/check-versions.mjs` (the `build` job passes it the resolved release tag, so the
+check is against that tag, not merely against the other sources); `publish.yml`'s privileged
+`publish` job carries its own **independent inline** re-check of the same six sources
+immediately before `npm publish`, and deliberately never calls the shared script. Both gates
+in `publish.yml` exist to catch the same class of mistake independently of each other; calling
+the shared script from both would collapse them into one implementation, and a single bad
+edit to it (or to the script it wraps) could then silently weaken every gate at once instead
+of just one. Keep the inline copy in sync with the script by hand when a version source is
+added or renamed — that manual sync is the price of the independence.
+
 ## Publish order (required)
 
 Each higher package depends on a lower one at `^0.x`, so they publish bottom-up — **client, then

@@ -1,0 +1,483 @@
+name: Publish to npm
+
+# Publishes client -> cli to npm on a published GitHub Release, using OIDC Trusted
+# Publishing — NO npm token. Provenance attestations are emitted automatically.
+# (@agentx402-ai/core is released separately from its own repo, agentx402-ai/core.)
+#
+# One-time setup (required before this works): configure a Trusted Publisher on EACH of
+# @agentrag/client, @agentrag/cli at npmjs.com → package → Settings → Trusted Publisher →
+# GitHub Actions → repository "agentx402-ai/agentrag", workflow "publish.yml" (filename
+# only, not a path), environment "release". The environment MUST match the publish job's
+# `environment:` exactly. Bump every version source (see RELEASING.md) before cutting the
+# Release, or the publish fails on an already-published version.
+#
+# SUPPLY-CHAIN SHAPE. The `publish` job below holds trusted-publishing rights for both
+# packages: any code executing in it can mint an OIDC token and publish an arbitrary tarball
+# as the SDK that authorizes real USDC payments. So it runs NO third-party code — no
+# dependency install, no bundler, no test runner — and passes `--ignore-scripts` to every npm
+# invocation so nothing gets execution from a lifecycle hook either. Everything that executes
+# dependency code (install, lint, build, test, audit) happens in the unprivileged `build`
+# job, which has NO `id-token` permission and hands over only the built `client/dist` +
+# `cli/dist`.
+#   SCOPE OF THAT CLAIM: this protects the publishing CREDENTIAL, not payload integrity. The
+#   dist is still produced by tsup/esbuild in the build job, so a compromised build
+#   dependency can still get its output published, provenance and all. The lockfile, the
+#   audit gate, `--ignore-scripts`, and SHA-pinned actions are what narrow that.
+# Splitting into two JOBS (not two workflow files) leaves the OIDC `workflow_ref` claim and
+# the `environment:release` subject unchanged, so the npm Trusted Publisher bindings — keyed
+# on repository + workflow FILENAME + environment — still match. Do not rename this file, do
+# not move `environment: release` off the job that runs `npm publish`.
+#
+# RECOVERY — and why this workflow only ever runs FROM THE TAG it publishes.
+# npm builds its SLSA provenance from GITHUB_REF and GITHUB_SHA, NOT from what was checked
+# out, with no consistency check against the working tree. So a "dispatch from main, publish
+# tag v0.4.0" path would ship the tag's code under an attestation naming main's HEAD — a
+# false attestation, in exactly the property this setup exists to provide. That is why the
+# dispatch takes no `tag` input any more: the ref IS the input. Hence:
+#   - Transient failure (registry blip): "Re-run all jobs", or
+#         gh workflow run publish.yml --ref v0.4.0
+#     Both keep GITHUB_REF on the tag, so provenance stays truthful.
+#   - A BUG IN THIS WORKFLOW baked into a tag cannot be fixed by re-running it: a run always
+#     executes the workflow file at the ref it runs from. Move the tag onto a commit carrying
+#     both the fixed workflow and the matching versions, or cut the next version.
+
+on:
+  release:
+    types: [published]
+  # Manual re-run path. MUST be dispatched from the tag (`--ref vX.Y.Z`); a branch dispatch
+  # is refused by the ref guard that is the `build` job's first step.
+  workflow_dispatch:
+
+# Deny by default; each job opts into exactly the scopes it needs.
+# No `concurrency` group on purpose. At the default queue depth of 1, a third arrival while
+# one run is queued silently CANCELS the pending one — reported as `cancelled`, so no failure
+# notification fires and a release simply never publishes. npm already rejects a duplicate
+# version, which is the race a group would have guarded against.
+permissions: {}
+
+jobs:
+  # Unprivileged: this is where every line of third-party code runs.
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      ref: ${{ steps.resolve.outputs.ref }}
+      npm_tag: ${{ steps.resolve.outputs.npm_tag }}
+    steps:
+      # Runs BEFORE checkout so nothing unvalidated reaches `ref:`. GITHUB_REF is matched,
+      # not GITHUB_REF_NAME, because REF_NAME strips `refs/heads/` and `refs/tags/`
+      # identically — a BRANCH named v0.4.0 would otherwise satisfy a check on the name
+      # alone. This is also what refuses a branch dispatch.
+      - name: Resolve and validate the tag being published
+        id: resolve
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          case "$REF" in
+            refs/tags/*) TAG="${REF#refs/tags/}" ;;
+            *)
+              echo "::error::Refusing to publish: '$REF' is not a tag ref."
+              echo "A manual re-run must be dispatched FROM THE TAG: gh workflow run publish.yml --ref vX.Y.Z"
+              exit 1
+              ;;
+          esac
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::Refusing to publish: '$TAG' is not a vX.Y.Z[-prerelease] release tag."
+            exit 1
+          fi
+          # npm rejects a prerelease published under the default dist-tag ("You must specify
+          # a tag using --tag when publishing a prerelease version"), which would otherwise
+          # fail at the very last step. Derive it so an RC goes to `next`, never `latest`.
+          case "${TAG#v}" in
+            *-*) NPM_TAG=next ;;
+            *) NPM_TAG=latest ;;
+          esac
+          printf 'tag=%s\n' "$TAG" >> "$GITHUB_OUTPUT"
+          # Fully qualified: a bare "v0.4.0" would be ambiguous if a BRANCH of that name
+          # also existed, and checkout would be free to resolve it to the branch.
+          printf 'ref=refs/tags/%s\n' "$TAG" >> "$GITHUB_OUTPUT"
+          printf 'npm_tag=%s\n' "$NPM_TAG" >> "$GITHUB_OUTPUT"
+          echo "resolved $TAG → npm dist-tag '$NPM_TAG'"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # Explicit and fully qualified, so what gets built is unambiguously the tag named
+          # in the provenance attestation.
+          ref: ${{ steps.resolve.outputs.ref }}
+          # Don't leave the job token in .git/config where a build step could reach it.
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          # Node 24 bundles npm >= 11.5.1 (required for OIDC trusted publishing)
+          # NATIVELY. Do not reintroduce `npm install -g npm@latest`: npm
+          # overwriting itself in-place is exactly what corrupted the bundle on
+          # the first v0.2.0 publish attempt (provenance.js → missing 'sigstore').
+          node-version: 24
+          cache: npm
+
+      # A Release tagged v0.4.0 cut on a commit still carrying 0.3.1 would otherwise publish
+      # 0.3.1 under that Release. The VERSION constants are compiled INTO the published
+      # bundles and the plugin's .mcp.json pin decides which CLI actually runs for plugin
+      # users, so a drift there ships packages that misreport themselves — check all six
+      # sources here, at the one moment it becomes irreversible, not only in CI.
+      - name: Guard — the tag must match every version source (RELEASING.md)
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # The same script ci.yml's `versions` job runs on every pull request, here handed
+          # the resolved tag so each of the six sources is checked against IT, not merely
+          # against the others. One implementation, two callers — the guard and the CI check
+          # can no longer drift apart, which is what made the two inline copies a hazard.
+          #
+          # Calling it does NOT weaken this job's "runs no third-party code before the build"
+          # property: it is first-party in-repo code, from this tag's own checkout, with no
+          # dependencies beyond node: builtins — which is why it can run before `npm ci`.
+          # Keep it dependency-free.
+          node scripts/check-versions.mjs "$TAG"
+
+      # --ignore-scripts: a compromised transitive dep must not get arbitrary execution just
+      # from being installed. Nothing here needs an install script — the platform binaries
+      # (esbuild, biome) arrive via optionalDependencies, and the build is tsup.
+      - run: npm ci --ignore-scripts
+      - run: npm run lint
+      - run: npm run build # MUST precede test: cli typecheck resolves @agentrag/client via client/dist
+      - run: npm test
+
+      # Consumers must never inherit a known-vulnerable runtime dep — that gate is hard.
+      # The full-tree gate is NOT hard here: a dev-chain advisory landing between the last CI
+      # run and the release carries no consumer exposure but would otherwise strand an
+      # already-tagged version, whose lockfile can no longer be edited. ci.yml holds the hard
+      # full-tree gate, where it is fixable on a branch.
+      - run: npm audit --omit=dev --audit-level=high
+      - run: npm audit --audit-level=high || echo "::warning::dev-chain advisories present — see ci.yml for the blocking gate"
+
+      # The ONLY thing that crosses the privilege boundary. Everything else the tarballs need
+      # (package.json, README.md, LICENSE) is already in the publish job's checkout of the
+      # same tag; `files: ["dist"]` in both manifests means dist is the whole delta.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist
+          # Two paths, so the artifact keeps the `client/`+`cli/` prefixes (upload-artifact
+          # takes the least common ancestor, which is the repo root for a multi-path upload)
+          # and unpacks straight onto the publish job's checkout.
+          path: |
+            client/dist
+            cli/dist
+          if-no-files-found: error
+          # v4+ artifacts are immutable and a re-run keeps the same run id, so without this
+          # "Re-run all jobs" — the primary recovery from a transient publish failure — dies
+          # on a 409 conflict.
+          overwrite: true
+          # The publish job consumes this immediately, so this only has to outlive a later
+          # "Re-run failed jobs" on a release that failed in the publish job — which reuses
+          # the run's existing artifact rather than rebuilding it. Note that a re-run resumes
+          # at the START of the publish job, not at the step that failed; the publish steps
+          # carry their own already-published guard so a half-published release can finish.
+          retention-days: 7
+
+  # Privileged: holds trusted-publishing rights for both packages. Runs no dependency code.
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    # LOAD-BEARING, do not remove. The npm Trusted Publisher for @agentrag/client and
+    # @agentrag/cli pins this environment, so the OIDC token's `environment` claim must be
+    # `release` or npm rejects the publish. A branch carrying a modified copy of this
+    # workflow with `environment:` stripped out mints a token that no longer matches the
+    # binding, and cannot publish. (Fails closed.)
+    # The environment also carries a deployment branch policy admitting only the `v*` TAG
+    # pattern (matching the sibling agentx402-ai/agentkv and agentx402-ai/core repos), so a
+    # non-tag ref is refused by repo settings even if the in-workflow ref guard were removed
+    # or edited on a branch. Two independent gates; keep both.
+    environment: release
+    permissions:
+      contents: read
+      id-token: write # required for npm OIDC trusted publishing
+    steps:
+      # No `cache: npm` and no install anywhere in this job — the checkout supplies the
+      # manifests, the artifact supplies the build, and nothing else is needed to publish.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.build.outputs.ref }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          # registry-url IS required — without it npm has no registry configured for the
+          # scoped packages and never initiates the OIDC exchange at all (ENEEDAUTH).
+          # NOTE: there is deliberately NO `_authToken` strip step here any more. That
+          # workaround existed for setup-node v6, which wrote a placeholder
+          # `//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}` that npm then preferred
+          # over the OIDC exchange, authenticated as anonymous, and got a misleading E404
+          # (actions/setup-node#1551). v7 removed that dummy export (#1558), so there is no
+          # placeholder left to strip, and the sibling agentx402-ai/agentkv and
+          # agentx402-ai/core repos publish with provenance on this exact configuration.
+          registry-url: https://registry.npmjs.org
+
+      - run: npm --version # publish provenance path needs an intact npm bundle
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          # Unpacks as client/dist + cli/dist onto the checkout of the same tag.
+          path: .
+
+      # This job, not the build job, is the one holding publishing rights, so it must
+      # independently refuse a mismatched ref rather than trusting an upstream check.
+      # It checks ALL SIX sources, not just the two package.json versions it used to. Four of
+      # the six were unverified here, and two of those — the VERSION constants — are compiled
+      # INTO the published bundles, so a drift shipped a package that misreports its own version
+      # at runtime (`agentrag --version`, the MCP handshake), unrecoverable without a new
+      # release. The sixth, the plugin's runtime pin, decides which CLI plugin users actually npx.
+      #
+      # DELIBERATELY INLINE and dependency-free: it must NOT call scripts/check-versions.mjs,
+      # which gate 1 in the build job uses — sharing one implementation across both gates would
+      # let a single edit disable both. Nothing is installed in this job.
+      - name: Guard — re-verify the tag matches every version source before publishing
+        env:
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          set -euo pipefail
+          node - <<'NODE'
+          const fs = require("fs");
+          const read = (p) => fs.readFileSync(p, "utf8");
+          const ver = (p) => JSON.parse(read(p)).version;
+          // Anchored at line start so a commented-out `// export const VERSION = "9.9.9"`
+          // sitting above the live declaration cannot win the match.
+          const konst = (p) => (read(p).match(/^export const VERSION = "([^"]+)"/m) || [])[1];
+          const want = process.env.TAG.replace(/^v/, "");
+          const v = {
+            clientPkg: ver("client/package.json"),
+            cliPkg: ver("cli/package.json"),
+            clientConst: konst("client/src/index.ts"),
+            cliConst: konst("cli/src/version.ts"),
+            plugin: ver("plugin/agentrag/.claude-plugin/plugin.json"),
+            mcpPin: (read("plugin/agentrag/.mcp.json").match(/"@agentrag\/cli@([^"]+)"/) || [])[1],
+          };
+          // Map a parse miss to "(not found)" BEFORE stringify: JSON.stringify drops an
+          // undefined value, which would print a bare {} and hide which source failed.
+          const bad = Object.fromEntries(
+            Object.entries(v)
+              .filter(([, got]) => got !== want)
+              .map(([k, got]) => [k, got ?? "(not found)"]),
+          );
+          if (Object.keys(bad).length) {
+            console.error(
+              "::error::Refusing to publish: tag " + process.env.TAG +
+                " does not match: " + JSON.stringify(bad),
+            );
+            process.exit(1);
+          }
+          const range = JSON.parse(read("cli/package.json")).dependencies["@agentrag/client"];
+          if (range !== "^" + want) {
+            console.error(
+              "::error::Refusing to publish: cli depends on @agentrag/client " + range +
+                ", expected ^" + want,
+            );
+            process.exit(1);
+          }
+          console.log("ok: tag and all 6 version sources + cli->client dep at " + want);
+          NODE
+
+      # The dist came over the wire from another job and nothing is installed here to rebuild
+      # it, so verify the payload is a complete build before it becomes a published version.
+      - name: Verify the downloaded artifact is a complete build
+        run: |
+          set -euo pipefail
+          # Heredoc rather than `node -e '...'`: the graph walk below needs both quote
+          # characters in its regexes, which a single-quoted shell string cannot carry.
+          node - <<'NODE'
+          const fs = require("fs");
+          const path = require("path");
+          const fail = (m) => { console.error("::error::" + m); process.exit(1); };
+          // Fixed entry points: client's four `exports` targets and cli's `bin`.
+          const entries = [
+            "client/dist/index.js",
+            "client/dist/index.cjs",
+            "client/dist/index.d.ts",
+            "client/dist/index.d.cts",
+            "cli/dist/cli.js",
+          ];
+          for (const f of entries) {
+            if (!fs.existsSync(f) || fs.statSync(f).size === 0) {
+              fail("missing or empty " + f + " in the build artifact");
+            }
+          }
+          // cli/dist is CODE-SPLIT: cli.js imports ./chunk-<hash>.js and ./mcp-<hash>.js,
+          // whose names change with every build and so cannot be listed above. Walk the
+          // import graph instead — an upload that DROPPED or ZEROED a chunk would otherwise
+          // publish a CLI that dies with ERR_MODULE_NOT_FOUND on its first run, and only a
+          // new version could fix it. (Scope: this catches missing/empty, not a partially
+          // written file — download-artifact v8 fails on digest mismatch, which does.)
+          const seen = new Set();
+          const queue = entries.filter((f) => /\.c?js$/.test(f));
+          while (queue.length) {
+            const f = queue.pop();
+            if (seen.has(f)) continue;
+            seen.add(f);
+            const src = fs.readFileSync(f, "utf8");
+            const specs = new Set();
+            for (const re of [
+              /\bfrom\s*["'](\.[^"']+)["']/g,
+              /\bimport\s*\(?\s*["'](\.[^"']+)["']/g,
+              /\brequire\(\s*["'](\.[^"']+)["']/g,
+            ]) {
+              for (const m of src.matchAll(re)) specs.add(m[1]);
+            }
+            for (const s of specs) {
+              const t = path.posix.join(path.posix.dirname(f), s);
+              if (!fs.existsSync(t) || fs.statSync(t).size === 0) {
+                fail(f + " imports " + s + " — missing or empty in the build artifact");
+              }
+              queue.push(t);
+            }
+          }
+          console.log("ok: artifact is a closed module graph over " + seen.size + " file(s)");
+          NODE
+          # upload-artifact does not preserve the executable bit — every file arrives 0644.
+          # Restore it on ALL of cli/dist, not just the bin: tar records each file's mode and
+          # npm keeps the exec bit in the tarball, so chmod'ing only cli.js publishes a
+          # tarball whose checksum differs from a local `npm pack` of the same build
+          # (measured: 439dd9c4… vs afd31bf7…, identical 8668 bytes). The chunks are imported
+          # rather than exec'd, so this is about keeping the artifact path byte-reproducible
+          # against a local build, not about runtime behavior.
+          #   client/dist is deliberately NOT chmod'd: nothing in it is executable locally
+          #   either, npm normalizes it to 0644 both ways, and marking it 0755 here would
+          #   introduce exactly the mismatch this is removing for cli.
+          # Runs AFTER the completeness check above so a wholly missing artifact reports the
+          # intended "missing or empty …" annotation rather than a raw chmod error.
+          chmod 755 cli/dist/*.js
+          # --ignore-scripts throughout: nothing third-party may execute in this job (a
+          # prepack would otherwise invoke tsup). This resolves the workspaces exactly the
+          # way the publish steps below do, so what is checked here is what gets published.
+          npm pack --dry-run --ignore-scripts -w client -w cli
+
+      # Order matters: client before cli, since @agentrag/cli depends on
+      # @agentrag/client at ^<version> — publishing cli first would E404 for consumers
+      # until client landed.
+      # `npm publish -w <name>` from the repo root, NOT `working-directory:` + a bare
+      # publish. This job has no node_modules, and `-w` needs none: npm resolves workspaces
+      # from the root package.json globs alone. Running everything from one directory means
+      # the verification above and the publishes below share a single resolution path, and
+      # it is the invocation the sibling agentkv repo's published provenance was produced by
+      # (0.2.2, 0.3.0-rc.1, 0.3.0 all carry SLSA attestations).
+      #   HISTORY — read this before changing the invocation. The sibling agentscout repo hit
+      #   this exact failure mode on its own first release and misdiagnosed it twice, each
+      #   wrong answer costing a run of CI archaeology (see agentx402-ai/agentscout's
+      #   publish.yml for the full incident write-up, preserved there rather than repeated
+      #   here since it is that repo's history, not this one's):
+      #   an early attempt there abandoned `-w` after npm failed ENEEDAUTH in ~1.5s without
+      #   attempting the exchange, reasoning that the workspace flag was "the only remaining
+      #   difference from every known-good example". Both that and a later guess blaming the
+      #   setup-node v6 `_authToken` placeholder were WRONG:
+      #     - the flag was ruled out BY MEASUREMENT — the identical failure occurred publishing
+      #       from inside each package directory, with no `-w` anywhere;
+      #     - the placeholder was already stripped when `-w` failed, and npm tries OIDC before
+      #       any static credential, so it only ever MASKED the error;
+      #     - the actual cause was the npm trusted-publisher config for the client package
+      #       naming a transposed org (a name nobody owned). Fixing that made publishing work.
+      #   npm reports a config mismatch as "OIDC token exchange error - package not found",
+      #   which means "no publisher config matched", NOT "no such package" — the string that
+      #   sent both misdiagnoses down the wrong path there.
+      #   SO: if a release here ever ENEEDAUTHs again, check `npm trust list` for BOTH
+      #   @agentrag/client and @agentrag/cli FIRST. Do not touch the workspace flag on the
+      #   strength of an ENEEDAUTH alone — verify the trusted-publisher config before
+      #   suspecting the invocation.
+      - name: Publish client (verbose — surfaces the OIDC exchange result)
+        env:
+          NPM_TAG: ${{ needs.build.outputs.npm_tag }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          # RE-RUN RECOVERY. client publishes before cli, so a cli-side failure (registry
+          # blip, rate limit) leaves client already on npm. A re-run restarts this job at its
+          # FIRST step, so without this guard the client publish below dies EEXIST and cli is
+          # never reached — the release stays half-published, and because a run always
+          # executes the workflow file at its own tag there is no in-tag fix. Skipping an
+          # already-published EXACT version lets the re-run finish the other half.
+          # Gated on run_attempt so a FIRST attempt stays strict: a version that already
+          # exists then is a genuine error (wrong tag, or someone else holds that version)
+          # and must still fail loudly rather than be silently skipped. `npm view` is an
+          # unauthenticated public read and needs no credential.
+          set -euo pipefail
+          VER="$(node -p "require('./client/package.json').version")"
+          if [ "${RUN_ATTEMPT:-1}" -gt 1 ] && npm view "@agentrag/client@$VER" version >/dev/null 2>&1; then
+            echo "::notice::@agentrag/client@$VER already published (run attempt $RUN_ATTEMPT) — skipping to cli."
+            exit 0
+          fi
+          set +e
+          # --provenance is passed EXPLICITLY. npm's docs say trusted publishing attests
+          # automatically, but multiple practitioner reports say the flag is still needed.
+          # It is a no-op if attestation already happens, and id-token: write is granted.
+          npm publish -w client --provenance --ignore-scripts --tag "$NPM_TAG" --loglevel verbose 2>&1 | tee /tmp/pub-client.log
+          CODE=${PIPESTATUS[0]}
+          set -e
+          echo "=================== OIDC exchange result (client) ==================="
+          grep -iE "oidc|token/exchange|needauth" /tmp/pub-client.log || echo "(npm never attempted OIDC — see the failure notes below)"
+          exit $CODE
+
+      - name: Publish cli (verbose — same OIDC diagnostics as client)
+        env:
+          NPM_TAG: ${{ needs.build.outputs.npm_tag }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          # Same re-run guard as the client step above, for symmetry: a run that published
+          # both and then failed in a later step re-runs to green instead of EEXIST.
+          set -euo pipefail
+          VER="$(node -p "require('./cli/package.json').version")"
+          if [ "${RUN_ATTEMPT:-1}" -gt 1 ] && npm view "@agentrag/cli@$VER" version >/dev/null 2>&1; then
+            echo "::notice::@agentrag/cli@$VER already published (run attempt $RUN_ATTEMPT) — nothing to do."
+            exit 0
+          fi
+          set +e
+          npm publish -w cli --provenance --ignore-scripts --tag "$NPM_TAG" --loglevel verbose 2>&1 | tee /tmp/pub-cli.log
+          CODE=${PIPESTATUS[0]}
+          set -e
+          echo "=================== OIDC exchange result (cli) ==================="
+          grep -iE "oidc|token/exchange|needauth" /tmp/pub-cli.log || echo "(npm never attempted OIDC — see the failure notes below)"
+          exit $CODE
+
+      # Runs only if a publish step above failed. A bare E404 here reads as "package
+      # missing" rather than "never authenticated" — that ambiguity cost the sibling
+      # agentscout repo five CI runs to diagnose once (see its publish.yml HISTORY note).
+      - name: Explain a publish failure
+        if: failure()
+        # Quoted heredoc disables ALL shell expansion: this is prose full of backticks and
+        # $-signs, and in a double-quoted echo backticks are COMMAND SUBSTITUTION.
+        run: |
+          cat <<'EOF'
+          ::error title=npm publish failed::Read the "OIDC exchange result" lines above first.
+          EOF
+          cat <<'EOF'
+
+          READ THE OIDC EXCHANGE LINES ABOVE — they say which half failed.
+
+          1) "POST 404 .../-/npm/v1/oidc/token/exchange/package/@agentrag%2f..."
+             + "OIDC token exchange error - package not found"
+             GitHub issued the token fine; npm's REGISTRY declined it. npm has no
+             trusted-publisher configuration matching this package. It says "package not
+             found" even when the package exists — it means "no publisher config matches".
+             Check on npmjs.com for EACH of @agentrag/client and @agentrag/cli:
+               package -> Settings -> Trusted Publisher -> GitHub Actions
+                 repository:  agentx402-ai/agentrag
+                 workflow:    publish.yml        (filename only, not a path)
+                 environment: release            <- MUST match the publish job's
+                                                    `environment:` exactly
+             Config on the ORG does not substitute for per-package config.
+
+          2) No OIDC lines at all, immediate ENEEDAUTH
+             npm never tried. Something is supplying a credential in preference to OIDC —
+             check whether an .npmrc carries an _authToken line (setup-node v6 wrote a
+             placeholder one; v7, used here, does not).
+
+          3) "EEXIST" / "cannot publish over previously published version"
+             Version already published. On a RE-RUN this is handled for you — the publish
+             steps skip an already-published exact version so a half-published release can
+             finish. Seeing it on the FIRST attempt means the version is genuinely taken:
+             bump every source per RELEASING.md and re-tag.
+
+          NOTE: a release re-run replays the workflow file snapshotted at the tag, so a fix
+          on main is ignored. To ship a workflow fix, move the tag or cut the next version.
+          EOF

@@ -1,0 +1,141 @@
+name: CI
+
+on:
+  workflow_dispatch: # allow manual re-runs (e.g. to get a green default-branch run on demand)
+  pull_request:
+  push:
+    branches: [main]
+    # A docs-only push to main doesn't need the full build/test matrix. PRs still run
+    # unfiltered (the pull_request trigger above), so every change is checked before it merges.
+    # The one check that must NOT be skipped on a docs-only push — no-internal-refs, since
+    # markdown is where a reference to the private backend is most likely to slip in — lives
+    # in refs.yml, which carries no paths filter.
+    paths-ignore:
+      - '**.md'
+
+# Deny by default. The repository's default workflow-token setting is already read-only,
+# but that is a mutable repo setting; pinning it here means a flip of that setting cannot
+# silently widen what a CI run can do. Each job re-grants only what it needs.
+permissions: {}
+
+# Actions are pinned to full commit SHAs, not mutable tags: a moved or compromised tag
+# would otherwise execute attacker code in CI, and publish.yml shares the same action set.
+# Dependabot (github-actions ecosystem) bumps these.
+# `npm ci --ignore-scripts` throughout mirrors publish.yml -- nothing here needs an install
+# script, so nothing gets arbitrary execution merely from being installed. (It also skips
+# the root `prepare` hook, which only wires local git hooks and is meaningless on a runner.)
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run lint # biome: format + lint (no build needed)
+
+  build-test:
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        # 24 = publish.yml's runtime (needed there for native npm OIDC): releases must
+        # ship from a Node the matrix actually tests.
+        node: [20, 22, 24]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "${{ matrix.node }}"
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run build # MUST precede test: cli typecheck resolves @agentrag/client via client/dist
+      - run: npm test # tsc --noEmit + vitest, both workspaces
+
+  audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci --ignore-scripts
+      # Two gates. The first is what consumers of the published packages are exposed to.
+      # The second is the HARD full-tree gate: a high-severity advisory in the dev chain
+      # that BUILDS those packages fails CI, where it is fixable on a branch rather than
+      # after a release. (--audit-level sets only the exit-code threshold; the report still
+      # lists everything, so low/moderate findings stay visible in the log.)
+      - run: npm audit --omit=dev --audit-level=high
+      - run: npm audit --audit-level=high
+  plugin-manifests:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "22"
+      - name: Validate plugin manifests are well-formed JSON
+        run: |
+          for f in plugin/agentrag/.claude-plugin/plugin.json \
+                   plugin/agentrag/.mcp.json; do
+            # NOTE: `node … && echo` would swallow the failure — under `bash -e`, a non-final
+            # command in an `&&` list does not trigger errexit, so a JSON.parse crash (or ENOENT)
+            # passed the job green. Run them as separate statements so errexit aborts on failure.
+            node -e "JSON.parse(require('fs').readFileSync('$f','utf8'))"
+            echo "ok: $f"
+          done
+
+  pack:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - run: npm pack --dry-run --workspaces
+
+  versions:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "22"
+      # The check lives in scripts/check-versions.mjs so a contributor can run the exact
+      # gate locally (`node scripts/check-versions.mjs`) before pushing. publish.yml runs
+      # the same script against the release TAG, so a mismatch is caught again at the one
+      # moment it becomes irreversible — one implementation, two callers, no drift.
+      - name: All six version sources + the cli→client dep must match (RELEASING.md)
+        run: node scripts/check-versions.mjs

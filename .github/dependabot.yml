@@ -1,0 +1,21 @@
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    groups:
+      dev-dependencies:
+        dependency-type: "development"
+    ignore:
+      # Skip routine major bumps — they are breaking (e.g. zod v4 vs. the MCP SDK's
+      # zod-3 requirement) and are adopted deliberately, not auto-PR'd. Minor, patch,
+      # AND Dependabot security updates still flow — `ignore` only suppresses
+      # version-update majors, never security updates.
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
