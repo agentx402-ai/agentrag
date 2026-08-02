@@ -37,10 +37,17 @@ function loadDocuments(path: string): IngestDocument[] {
   return parsed as IngestDocument[];
 }
 
-export async function runIngest(
-  args: string[],
-  io: { client: IngestClient; stdout: Writer; stderr: Writer },
-): Promise<number> {
+/** The validated result of parseIngestArgs: either ready-to-send opts, or a usage-error message. */
+export type IngestArgs = { ok: true; opts: IngestOptions } | { ok: false; message: string };
+
+/**
+ * Parse and validate `ingest`'s own arguments — no client, no network. See parseAskArgs's doc
+ * comment (commands/ask.ts) for why this is split out: cli.ts runs it before clientFromConfig,
+ * which mints a wallet on first use. ingest has no required positional, but a bad --documents
+ * file (missing, invalid JSON, or not an array) is the same class of usage error and must clear
+ * before a client is ever built.
+ */
+export function parseIngestArgs(args: string[]): IngestArgs {
   const { flags } = parseFlags(args, INGEST_FLAGS);
   const f = flags as {
     sources?: string[];
@@ -55,22 +62,33 @@ export async function runIngest(
     try {
       documents = loadDocuments(f.documents);
     } catch (e) {
-      if (e instanceof UsageError) {
-        printError(io.stderr, "usage", e.message);
-        return EXIT.USAGE;
-      }
+      if (e instanceof UsageError) return { ok: false, message: e.message };
       throw e;
     }
   }
-  const opts: IngestOptions = {
-    sources: f.sources,
-    documents,
-    collection: f.collection,
-    model: f.model,
-    maxPages: f.maxPages,
-    refresh: f.refresh,
+  return {
+    ok: true,
+    opts: {
+      sources: f.sources,
+      documents,
+      collection: f.collection,
+      model: f.model,
+      maxPages: f.maxPages,
+      refresh: f.refresh,
+    },
   };
-  const result = await io.client.ingest(opts);
+}
+
+export async function runIngest(
+  args: string[],
+  io: { client: IngestClient; stdout: Writer; stderr: Writer },
+): Promise<number> {
+  const parsed = parseIngestArgs(args);
+  if (!parsed.ok) {
+    printError(io.stderr, "usage", parsed.message);
+    return EXIT.USAGE;
+  }
+  const result = await io.client.ingest(parsed.opts);
   printJson(io.stdout, result);
   return EXIT.OK;
 }

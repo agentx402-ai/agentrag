@@ -2,11 +2,11 @@ import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { type AgentRag, AgentRagError, AgentXError, SpendCapError } from "@agentrag/client";
 import { parseFlags, UsageError } from "./args";
-import { runAsk } from "./commands/ask";
-import { runDelete } from "./commands/delete";
-import { runExtend } from "./commands/extend";
-import { runIngest } from "./commands/ingest";
-import { runStatus } from "./commands/status";
+import { parseAskArgs, runAsk } from "./commands/ask";
+import { parseDeleteArgs, runDelete } from "./commands/delete";
+import { parseExtendArgs, runExtend } from "./commands/extend";
+import { parseIngestArgs, runIngest } from "./commands/ingest";
+import { parseStatusArgs, runStatus } from "./commands/status";
 import { runWallet } from "./commands/wallet";
 import { clientFromConfig, readConfigFile, resolveConfig } from "./config";
 import { EXIT, printError, type Writer } from "./output";
@@ -81,6 +81,29 @@ export async function runCli(
       return runWallet(rest, { stdout, stderr, env });
     }
     const cfg = resolveConfig(parseFlags(rest).flags, env, () => readConfigFile(env));
+    // Validate the command's OWN arguments (required positionals, its per-command flag
+    // allowlist, and any flag-value checks such as extend's --days enum) BEFORE the client
+    // construction below — clientFromConfig mints and persists a wallet on first use
+    // (config.ts), so a usage error must never get that far. Each parseXxxArgs is the exact
+    // check runXxx itself runs (and calls again) — see parseAskArgs's doc comment — so there is
+    // one source of truth for what counts as valid; a parseFlags-level throw (unknown/
+    // disallowed flag, bad value) still propagates straight to mapError below, unchanged.
+    if (cmd === "ask") {
+      const parsed = parseAskArgs(rest);
+      if (!parsed.ok) return usageFail(stderr, parsed.message);
+    } else if (cmd === "ingest") {
+      const parsed = parseIngestArgs(rest);
+      if (!parsed.ok) return usageFail(stderr, parsed.message);
+    } else if (cmd === "extend") {
+      const parsed = parseExtendArgs(rest);
+      if (!parsed.ok) return usageFail(stderr, parsed.message);
+    } else if (cmd === "status") {
+      const parsed = parseStatusArgs(rest);
+      if (!parsed.ok) return usageFail(stderr, parsed.message);
+    } else {
+      const parsed = parseDeleteArgs(rest);
+      if (!parsed.ok) return usageFail(stderr, parsed.message);
+    }
     const client =
       deps.client ??
       clientFromConfig(cfg, {
@@ -96,6 +119,12 @@ export async function runCli(
   } catch (e) {
     return mapError(e, stderr);
   }
+}
+
+/** Print a usage error in the same shape mapError gives UsageError, and return EXIT.USAGE. */
+function usageFail(stderr: Writer, message: string): number {
+  printError(stderr, "usage", message);
+  return EXIT.USAGE;
 }
 
 function mapError(e: unknown, stderr: Writer): number {

@@ -9,16 +9,23 @@ export type AskClient = {
   askAndWait: (query: string, o?: AskOptions) => Promise<unknown>;
 };
 
-export async function runAsk(
-  args: string[],
-  io: { client: AskClient; stdout: Writer; stderr: Writer },
-): Promise<number> {
+/** The validated result of parseAskArgs: either ready-to-send args, or a usage-error message. */
+export type AskArgs =
+  | { ok: true; query: string; opts: AskOptions; wait: boolean }
+  | { ok: false; message: string };
+
+/**
+ * Parse and fully validate `ask`'s own arguments — no client, no network. Split out of runAsk so
+ * cli.ts can run this SAME check before constructing the client: clientFromConfig (config.ts)
+ * mints and persists a wallet on first use, so a missing/invalid argument must never get that
+ * far. parseFlags's own throws (unknown/disallowed flag, missing/malformed value) are
+ * deliberately NOT caught here — they propagate exactly as before, straight to runCli's
+ * mapError.
+ */
+export function parseAskArgs(args: string[]): AskArgs {
   const { flags, positionals } = parseFlags(args, ASK_FLAGS);
   const query = positionals[0];
-  if (!query) {
-    printError(io.stderr, "usage", "ask requires <query>");
-    return EXIT.USAGE;
-  }
+  if (!query) return { ok: false, message: "ask requires <query>" };
   const f = flags as {
     sources?: string[];
     collection?: string;
@@ -27,16 +34,32 @@ export async function runAsk(
     maxPages?: number;
     wait?: boolean;
   };
-  const opts: AskOptions = {
-    sources: f.sources,
-    collection: f.collection,
-    topK: f.topK,
-    mode: f.mode,
-    maxPages: f.maxPages,
+  return {
+    ok: true,
+    query,
+    wait: !!f.wait,
+    opts: {
+      sources: f.sources,
+      collection: f.collection,
+      topK: f.topK,
+      mode: f.mode,
+      maxPages: f.maxPages,
+    },
   };
-  const result = f.wait
-    ? await io.client.askAndWait(query, opts)
-    : await io.client.ask(query, opts);
+}
+
+export async function runAsk(
+  args: string[],
+  io: { client: AskClient; stdout: Writer; stderr: Writer },
+): Promise<number> {
+  const parsed = parseAskArgs(args);
+  if (!parsed.ok) {
+    printError(io.stderr, "usage", parsed.message);
+    return EXIT.USAGE;
+  }
+  const result = parsed.wait
+    ? await io.client.askAndWait(parsed.query, parsed.opts)
+    : await io.client.ask(parsed.query, parsed.opts);
   printJson(io.stdout, result);
   return EXIT.OK;
 }
