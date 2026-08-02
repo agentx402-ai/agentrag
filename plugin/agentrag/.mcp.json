@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "agentrag": {
+      "command": "npx",
+      "args": ["-y", "@agentrag/cli@0.1.0", "mcp"],
+      "env": {
+        "AGENTRAG_ENDPOINT": "${user_config.endpoint:-}",
+        "AGENTRAG_PRIVATE_KEY": "${user_config.private_key:-}",
+        "AGENTRAG_ACCOUNT_KEY": "${user_config.account_key:-}",
+        "AGENTRAG_NETWORK": "${user_config.network:-eip155:8453}",
+        "AGENTRAG_MAX_SPEND_USD": "${user_config.max_spend_usd:-}",
+        "AGENTRAG_MAX_SESSION_SPEND_USD": "${user_config.max_session_spend_usd:-}"
+      }
+    }
+  }
+}

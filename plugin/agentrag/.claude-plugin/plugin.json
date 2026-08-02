@@ -1,0 +1,55 @@
+{
+  "name": "agentrag",
+  "version": "0.1.0",
+  "description": "AgentRAG: x402-paid retrieval-augmented generation for agents. Ingest your own documents or URLs into a collection (hybrid BM25 + vector search), then ask grounded questions against them — paid per call in USDC, no accounts or API keys.",
+  "license": "MIT",
+  "author": {
+    "name": "The AgentRAG Authors",
+    "url": "https://github.com/agentx402-ai/agentrag"
+  },
+  "homepage": "https://github.com/agentx402-ai/agentrag",
+  "userConfig": {
+    "private_key": {
+      "type": "string",
+      "title": "Wallet private key (optional)",
+      "description": "EVM private key (hex, 0x-prefixed) for the wallet that pays. Leave blank and AgentRAG mints + manages a local wallet for you on first use (then fund it).",
+      "sensitive": true,
+      "required": false
+    },
+    "account_key": {
+      "type": "string",
+      "title": "Account key (optional)",
+      "description": "An ak_ bearer token for managed-wallet (credit) mode. Funded out-of-band via AgentKV. Mutually exclusive with a wallet key.",
+      "sensitive": true,
+      "required": false
+    },
+    "endpoint": {
+      "type": "string",
+      "title": "AgentRAG endpoint",
+      "description": "The AgentRAG API endpoint. Defaults to the hosted service.",
+      "required": false,
+      "default": "https://api.agentx402.ai"
+    },
+    "network": {
+      "type": "string",
+      "title": "Network (optional)",
+      "description": "CAIP-2 network id: eip155:8453 (Base mainnet, default) or eip155:84532 (Base Sepolia testnet).",
+      "required": false,
+      "default": "eip155:8453"
+    },
+    "max_spend_usd": {
+      "type": "number",
+      "title": "Max per-operation spend, USD (optional)",
+      "description": "Refuse any single operation that would cost more than this. Leave empty for no per-op cap.",
+      "required": false,
+      "min": 0
+    },
+    "max_session_spend_usd": {
+      "type": "number",
+      "title": "Max session spend, USD (optional)",
+      "description": "Refuse operations once cumulative spend across the whole MCP session exceeds this. Leave empty for no session cap.",
+      "required": false,
+      "min": 0
+    }
+  }
+}
