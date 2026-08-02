@@ -198,8 +198,10 @@ conditionally, and the safe remedy is `extend()`, not "use it again":
 
 - `ingest` slides `expires_at` only when it actually indexes at least one new page.
   Re-ingesting sources the collection already has (no `refresh`, or nothing new to fetch) appends
-  nothing and does **not** slide — and in wallet mode still settles the quoted amount for the
-  attempt. Do not rely on a re-ingest as a keep-alive; call `extend()` to control lifetime instead.
+  nothing and does **not** slide — and it is not reliably free either: depending on timing it
+  either dedupes to a free cache-hit, or settles the quoted amount and refunds the full amount
+  back as credits. Either way, it does not keep the collection alive — do not rely on a
+  re-ingest as a keep-alive; call `extend()` to control lifetime instead.
 - `ask` slides it **only** when the query actually matched (`result.matched === true`). A
   no-match `ask` is free and does **not** extend the collection, and neither does an idempotency
   replay — so relying on query traffic to keep a collection alive can silently fail.

@@ -119,8 +119,10 @@ conditionally, and the safe remedy is `rag_extend`, not "ask it again":
 
 - `rag_ingest` slides the expiry only when it actually indexes at least one new page.
   Re-ingesting sources the collection already has appends nothing and does **not** slide — and
-  in wallet mode still settles the quoted amount for the attempt. Do not rely on a re-ingest as
-  a keep-alive; use `rag_extend` to control lifetime instead.
+  it is not reliably free either: depending on timing it either dedupes to a free cache-hit, or
+  settles the quoted amount and refunds the full amount back as credits. Either way, it does not
+  keep the collection alive — do not rely on a re-ingest as a keep-alive; use `rag_extend` to
+  control lifetime instead.
 - `rag_ask` slides it **only** when the query actually matched. A no-match never settles
   anything on the ask leg itself — but on a **composite** ask (one that triggered an on-demand
   ingest), the ingest leg already settled before the query ran, so a no-match still cost that

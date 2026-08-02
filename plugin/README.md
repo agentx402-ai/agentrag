@@ -36,11 +36,41 @@ Collection content is **not** encrypted (it is stored and indexed in the clear s
 ```
 
 <details>
-<summary>From a local checkout (for development — also the only method that works pre-release)</summary>
+<summary>From a local checkout (for development)</summary>
 
 ```bash
 git clone https://github.com/agentx402-ai/agentrag
 cd agentrag && npm ci && npm run build
+```
+
+`--plugin-dir` still loads `plugin/agentrag/.mcp.json` as checked in, and that file still runs
+`npx -y @agentrag/cli@0.1.0 mcp` — a version-pinned registry spec that fails until
+`@agentrag/cli` is published (see the pre-release note above), regardless of the local build you
+just made. Until then, point your **local, uncommitted** copy of `.mcp.json` at that build
+instead — edit `command`/`args` only, leave `env` as-is:
+
+```json
+{
+  "mcpServers": {
+    "agentrag": {
+      "command": "node",
+      "args": ["/absolute/path/to/agentrag/cli/dist/cli.js", "mcp"],
+      "env": {
+        "AGENTRAG_ENDPOINT": "${user_config.endpoint:-}",
+        "AGENTRAG_PRIVATE_KEY": "${user_config.private_key:-}",
+        "AGENTRAG_ACCOUNT_KEY": "${user_config.account_key:-}",
+        "AGENTRAG_NETWORK": "${user_config.network:-eip155:8453}",
+        "AGENTRAG_MAX_SPEND_USD": "${user_config.max_spend_usd:-}",
+        "AGENTRAG_MAX_SESSION_SPEND_USD": "${user_config.max_session_spend_usd:-}"
+      }
+    }
+  }
+}
+```
+
+Then:
+
+```bash
 claude --plugin-dir ./plugin/agentrag
 ```
 
