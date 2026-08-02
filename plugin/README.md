@@ -10,8 +10,10 @@ free `rag_wallet_address` (find the address to fund). Every paid call settles in
 Collection content is **not** encrypted (it is stored and indexed in the clear server-side).
 
 > **Prerequisite:** the plugin runs `npx -y @agentrag/cli mcp`, so [`@agentrag/cli`](../cli)
-> must be resolvable via `npx`. It is published to npm, so `npx` fetches it on first use — no local
-> checkout required (the local-checkout method below is only for development).
+> must be resolvable via `npx`. **As of this writing, `@agentrag/cli` has not yet been published
+> to npm** (that happens at the project's first release) — until then `npx` cannot resolve it and
+> the server fails to start, so use the local-checkout method below instead. Once published,
+> `npx` fetches it automatically on first use and no local checkout is required.
 >
 > **Windows:** `.mcp.json` uses `"command": "npx"`. Claude Code's MCP launcher resolves the
 > `npx.cmd` shim on Windows automatically, so this works as-is. Other MCP clients that spawn the
@@ -21,6 +23,11 @@ Collection content is **not** encrypted (it is stored and indexed in the clear s
 
 ## Install
 
+> **Pre-release note:** as of this writing, `@agentrag/cli` has not yet been published to npm
+> and this plugin has not yet been registered in the shared marketplace, so the marketplace
+> steps below don't work yet end-to-end. Use the **local checkout** method instead until both
+> are live.
+
 **1. Add the marketplace and install the plugin** — run these in Claude Code:
 
 ```text
@@ -29,7 +36,7 @@ Collection content is **not** encrypted (it is stored and indexed in the clear s
 ```
 
 <details>
-<summary>From a local checkout (for development)</summary>
+<summary>From a local checkout (for development — also the only method that works pre-release)</summary>
 
 ```bash
 git clone https://github.com/agentx402-ai/agentrag
@@ -45,7 +52,7 @@ threads it into the MCP server for you — **no shell environment variables to s
 | Prompt | Required | Notes |
 |--------|----------|-------|
 | Wallet private key | No | Optional — leave blank and AgentRAG mints + manages a local wallet on first use. To bring your own: an EVM hex key, masked + stored in your OS keychain |
-| Account key | No | An `ak_…` bearer token for managed-wallet (credit) mode; funded out-of-band via AgentKV. Mutually exclusive with a wallet key |
+| Account key | No | An `ak_…` bearer token for managed-wallet (credit) mode; funded out-of-band via AgentKV. If a wallet private key is also set, the account key silently wins and the wallet key is ignored |
 | AgentRAG endpoint | No | Defaults to `https://api.agentx402.ai` (the hosted service) |
 | Network | No | `eip155:8453` (Base mainnet, default) or `eip155:84532` (Base Sepolia testnet) |
 | Max per-operation spend (USD) | No | refuses any single call costing more than this; leave empty for no per-op cap |

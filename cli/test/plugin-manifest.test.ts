@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { type ResolvedConfig, resolveConfig } from "../src/config";
 
 // The plugin's two manifests have to agree with each other, and nothing else checks that they do:
 // CI validates they are well-formed JSON, never what is inside them. A sibling repo shipped a real
@@ -74,5 +75,85 @@ describe("plugin manifests agree", () => {
     expect(pinned).toBeDefined();
     expect(pinned).not.toContain("@latest");
     expect(pinned).toMatch(/^@agentrag\/cli@\d+\.\d+\.\d+/);
+  });
+
+  // Rule, not a name list: the two tests above pin "private_key"/"account_key" by name, so a
+  // THIRD secret-shaped field (e.g. a future seed_phrase) would ship with no sensitive:true and
+  // nothing here would catch it — displayed and stored in plaintext in the plugin config UI.
+  it("every secret-shaped userConfig field is marked sensitive (name-pattern rule, not just the two known fields)", () => {
+    const secretLike = /key|secret|seed|mnemonic|passphrase|token/i;
+    const unmarked = Object.entries(plugin.userConfig)
+      .filter(([name]) => secretLike.test(name))
+      .filter(([, def]) => (def as { sensitive?: boolean }).sensitive !== true)
+      .map(([name]) => name);
+    expect(unmarked).toEqual([]);
+  });
+});
+
+// The suite above only proves each "${user_config.X}" REFERENCE resolves to a declared
+// userConfig field — it never checks the env var NAME on the left (e.g.
+// "AGENTRAG_MAX_SESSION_SPEND_USD") against what `resolveConfig` actually reads. A rename on
+// either side leaves every check above green: the manifest is still internally consistent, but
+// the CLI reads `undefined` for that var and silently applies its documented default — no spend
+// cap (warning on stderr only, which a plugin user never sees), a freshly minted unfunded
+// wallet in place of the configured private key, or dropping out of account-key mode entirely.
+describe("plugin env var NAMES match what resolveConfig actually reads", () => {
+  // One sentinel per env var .mcp.json declares, plus the resolved-config field it MUST land in.
+  // Values are fixed here, independent of config.ts, so this cannot pass by construction — it
+  // only passes if resolveConfig genuinely reads that exact env var name into that exact field.
+  const checks: Record<
+    string,
+    { raw: string; expected: unknown; read: (c: ResolvedConfig) => unknown }
+  > = {
+    AGENTRAG_ENDPOINT: {
+      raw: "https://sentinel.example",
+      expected: "https://sentinel.example",
+      read: (c) => c.endpoint,
+    },
+    AGENTRAG_NETWORK: {
+      raw: "eip155:999999",
+      expected: "eip155:999999",
+      read: (c) => c.network,
+    },
+    AGENTRAG_MAX_SPEND_USD: {
+      raw: "1.25",
+      expected: 1.25,
+      read: (c) => c.maxSpendUsd,
+    },
+    AGENTRAG_MAX_SESSION_SPEND_USD: {
+      raw: "9.75",
+      expected: 9.75,
+      read: (c) => c.maxSessionSpendUsd,
+    },
+    AGENTRAG_PRIVATE_KEY: {
+      raw: "0xsentinelprivatekey",
+      expected: "0xsentinelprivatekey",
+      read: (c) => c.privateKey,
+    },
+    AGENTRAG_ACCOUNT_KEY: {
+      raw: "sentinel-account-key",
+      expected: "sentinel-account-key",
+      read: (c) => c.accountKey,
+    },
+  };
+
+  it("every env var .mcp.json declares has a check here, and vice versa", () => {
+    // Bidirectional-by-NAME, mirroring the bidirectional-by-REFERENCE checks above: an env var
+    // added to .mcp.json with no matching entry here would otherwise go untested, not merely
+    // undetected — this fails loudly instead of silently skipping coverage.
+    expect(Object.keys(checks).sort()).toEqual(Object.keys(env).sort());
+  });
+
+  it("each sentinel value survives the REAL resolveConfig into the field it claims to set", () => {
+    const sentinelEnv: NodeJS.ProcessEnv = {};
+    for (const [name, check] of Object.entries(checks)) sentinelEnv[name] = check.raw;
+    // The exact function `prepareMcp` calls in production: resolveConfig({}, deps.env, ...).
+    // No fake/injected config layer — this drives the ambient env-reading path for real.
+    const resolved = resolveConfig({}, sentinelEnv, () => null);
+    for (const [name, check] of Object.entries(checks)) {
+      expect(check.read(resolved), `${name} did not reach its claimed config field`).toEqual(
+        check.expected,
+      );
+    }
   });
 });

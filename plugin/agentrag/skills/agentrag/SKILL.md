@@ -117,10 +117,15 @@ credits**, at 80% of the wallet-mode price. Two things are specific to AgentRAG:
 A collection's expiry is not fixed at creation — it can slide forward on paid use, but only
 conditionally, and the safe remedy is `rag_extend`, not "ask it again":
 
-- `rag_ingest` always slides the expiry forward.
-- `rag_ask` slides it **only** when the query actually matched. A no-match ask is free and does
-  **not** extend the collection, and neither does an idempotency replay — so relying on query
-  traffic to keep a collection alive can silently fail.
+- `rag_ingest` slides the expiry only when it actually indexes at least one new page.
+  Re-ingesting sources the collection already has appends nothing and does **not** slide — and
+  in wallet mode still settles the quoted amount for the attempt. Do not rely on a re-ingest as
+  a keep-alive; use `rag_extend` to control lifetime instead.
+- `rag_ask` slides it **only** when the query actually matched. A no-match never settles
+  anything on the ask leg itself — but on a **composite** ask (one that triggered an on-demand
+  ingest), the ingest leg already settled before the query ran, so a no-match still cost that
+  ingest even though the ask stays free. Neither a no-match nor an idempotency replay extends
+  the collection — so relying on query traffic to keep a collection alive can silently fail.
 - **Expiry is terminal.** Neither paid traffic nor `rag_extend` revives an already-expired
   collection — recovery is re-ingesting from scratch. Call `rag_status` to check `expires_at`
   and extend proactively if you want the lifetime under your own control rather than contingent
@@ -139,7 +144,7 @@ Claude Code **prompts** for the config and threads it into the MCP server for yo
 | Config | Required | Description |
 |--------|----------|-------------|
 | Wallet private key | No | Optional — leave blank and AgentRAG mints + manages a local wallet on first use (then fund it). To bring your own: an EVM private key (hex), the wallet that pays. |
-| Account key | No | An `ak_…` bearer token for managed-wallet (credit) mode. Funded out-of-band via AgentKV. Mutually exclusive with a wallet key. |
+| Account key | No | An `ak_…` bearer token for managed-wallet (credit) mode. Funded out-of-band via AgentKV. If a wallet private key is also set, the account key silently wins and the wallet key is ignored. |
 | AgentRAG endpoint | No | The hosted API; defaults to `https://api.agentx402.ai`. |
 | Network | No | `eip155:8453` (Base mainnet, default) or `eip155:84532` (Base Sepolia testnet). |
 | Max per-operation spend (USD) | No | Refuse any single call that would cost more than this; empty = no per-op cap. |

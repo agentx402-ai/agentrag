@@ -19,7 +19,7 @@
     "account_key": {
       "type": "string",
       "title": "Account key (optional)",
-      "description": "An ak_ bearer token for managed-wallet (credit) mode. Funded out-of-band via AgentKV. Mutually exclusive with a wallet key.",
+      "description": "An ak_ bearer token for managed-wallet (credit) mode. Funded out-of-band via AgentKV. If a wallet private key is also set, the account key silently wins and the wallet key is ignored.",
       "sensitive": true,
       "required": false
     },
