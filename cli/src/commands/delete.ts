@@ -7,16 +7,30 @@ export type DeleteClient = {
   delete: (collection: string) => Promise<unknown>;
 };
 
+/** The validated result of parseDeleteArgs: either the collection, or a usage-error message. */
+export type DeleteArgs = { ok: true; collection: string } | { ok: false; message: string };
+
+/**
+ * Parse and validate `delete`'s own arguments — no client, no network. See parseAskArgs's doc
+ * comment (commands/ask.ts) for why this is split out: cli.ts runs it before clientFromConfig,
+ * which mints a wallet on first use.
+ */
+export function parseDeleteArgs(args: string[]): DeleteArgs {
+  const { positionals } = parseFlags(args, DELETE_FLAGS);
+  const collection = positionals[0];
+  if (!collection) return { ok: false, message: "delete requires <collection>" };
+  return { ok: true, collection };
+}
+
 export async function runDelete(
   args: string[],
   io: { client: DeleteClient; stdout: Writer; stderr: Writer },
 ): Promise<number> {
-  const { positionals } = parseFlags(args, DELETE_FLAGS);
-  const collection = positionals[0];
-  if (!collection) {
-    printError(io.stderr, "usage", "delete requires <collection>");
+  const parsed = parseDeleteArgs(args);
+  if (!parsed.ok) {
+    printError(io.stderr, "usage", parsed.message);
     return EXIT.USAGE;
   }
-  printJson(io.stdout, await io.client.delete(collection));
+  printJson(io.stdout, await io.client.delete(parsed.collection));
   return EXIT.OK;
 }
