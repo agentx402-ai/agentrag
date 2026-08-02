@@ -196,7 +196,10 @@ UTF-8 bytes).
 A collection's `expires_at` is not fixed at creation — it can slide forward on paid use, but only
 conditionally, and the safe remedy is `extend()`, not "use it again":
 
-- `ingest` always slides `expires_at` forward.
+- `ingest` slides `expires_at` only when it actually indexes at least one new page.
+  Re-ingesting sources the collection already has (no `refresh`, or nothing new to fetch) appends
+  nothing and does **not** slide — and in wallet mode still settles the quoted amount for the
+  attempt. Do not rely on a re-ingest as a keep-alive; call `extend()` to control lifetime instead.
 - `ask` slides it **only** when the query actually matched (`result.matched === true`). A
   no-match `ask` is free and does **not** extend the collection, and neither does an idempotency
   replay — so relying on query traffic to keep a collection alive can silently fail.
