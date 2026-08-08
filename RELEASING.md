@@ -45,6 +45,36 @@ fails `EEXIST`. (Publishing a higher package before the one it depends on would 
 consumers until the dependency lands; the enforced order prevents that.) If you also changed
 `@agentx402-ai/core`, release it first from its own repo and bump the `^` range in `client`/`cli`.
 
+## First publish of a NEW package (one time only — does not apply here again)
+
+**The "never `npm publish` from a laptop" rule above cannot apply to a package that does not exist
+yet.** npm will not let you configure a trusted publisher for a package name that has never been
+published, so OIDC has nothing to attach to and the workflow cannot make the first release. Every
+package in this org took this path: `@agentrag/client` and `@agentrag/cli` `0.1.0`, like
+`@agentkv/client` `0.1.0`–`0.1.2`, `@agentscout/client` `0.1.0`–`0.1.2` and `@agentx402-ai/core`
+`0.1.0`, carry **no provenance attestation**. Every version after each package's bootstrap does.
+
+If you are standing up a new package (a fourth service, a split-out library), the order is:
+
+1. **Generate a classic _Automation_ token.** 2FA is enforced on publish for this org, and only an
+   Automation token bypasses it — a granular or "publish" token fails `EOTP` and drops into an
+   interactive browser-auth prompt that cannot complete in a script.
+2. `npm publish -w client` then `npm publish -w cli`, **in that order** (`cli` depends on `client`
+   at `^x.y.z`; reversed, the CLI is installable and broken until the dependency lands).
+3. **Configure Trusted Publishing** on npmjs.com for **both** packages.
+4. **Delete the Automation token.** From here the rule at the top of this section is true again.
+
+Two traps worth knowing before you hit them:
+
+- **`npm publish --dry-run` exits 0 regardless.** It never contacts the publish endpoint, so it
+  cannot surface `EOTP` and tells you nothing about whether a token can actually publish.
+- **The registry's read path can lag its write path by minutes.** During the AgentRAG bootstrap,
+  `client` returned 404 for ~200s *after* a successful publish while `cli`, published after it, was
+  already live — so `npm i` of the CLI failed on an unresolvable dependency in between. If a
+  just-published package 404s, **retry the publish**: `E403 cannot publish over the previously
+  published versions` proves it landed and only the read path is behind. Never republish blindly,
+  and never unpublish.
+
 ## Steps
 
 1. Bump every version source above (the six in-repo sources, including the `.mcp.json` runtime
