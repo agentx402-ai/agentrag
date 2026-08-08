@@ -2,6 +2,39 @@
 
 All notable changes to this project are documented here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project adheres to [SemVer](https://semver.org/).
 
+## [0.1.2] — 2026-08-08
+
+### Added
+
+- **Ingest progress now says why pages failed.** Every surface that reports ingest progress
+  — `AskResult.ingest`, the `AskPending` returned by `ask()`/`ingest()`, and
+  `CollectionStatus.job` — can now carry `pages_ok`, `pages_failed`,
+  `failures[{ url, reason }]` and `stopped`.
+
+  Previously an ingest could fail every page and report it in the vocabulary of success:
+  `pages_done === pages_total`, `status: "complete"`, an empty collection, and nothing
+  saying why. A toll-gated source is the realistic way to hit that — AgentRAG fetches
+  through AgentScout with no toll budget, so a paywalled page fails closed as
+  `upstream_status_402` rather than being paid for.
+
+- **`RagPageFailure` and `IngestFailureDetail`** are exported. `IngestProgress` extends the
+  latter, and `AskPending` and `CollectionStatus.job` mirror it field-for-field, so the
+  three progress surfaces cannot drift apart.
+
+### Notes
+
+- Every new field is **optional**, and reading them defensively is required rather than
+  polite: collections whose ingest job predates this release still return a progress block
+  without them, and Durable Object rows have no migration path.
+- `failures` is capped server-side at 20 entries across a whole job. **`pages_failed` is the
+  authoritative count** — on a large wholesale failure the array is shorter than it, so
+  never read `failures.length` as the number of failures.
+- `reason` is a free-form, open set (`upstream_status_402`, `thin_content`, `no_chunks`,
+  `fetch_failed:*`), deliberately not part of the `RagErrorCode` taxonomy: it describes one
+  page's fate, not the request's outcome. Match with `startsWith`, never exhaustively.
+- Requires the AgentRAG service deployed 2026-08-08 or later. Against an older service the
+  fields are simply absent, which is exactly the pre-detail behavior above.
+
 ## [0.1.1] — 2026-08-08
 
 ### Changed

@@ -145,6 +145,80 @@ describe("status()", () => {
     });
   });
 
+  it("surfaces per-page failure reasons on the job block, so an empty collection explains itself", async () => {
+    // The motivating case. Server-side, a job that failed every page still reports
+    // pages_done === pages_total and state "complete" — a total failure wearing the shape
+    // of a total success. These fields are the only thing that tells them apart, and
+    // upstream_status_402 is the realistic reason: AgentRAG fetches through AgentScout
+    // with NO toll budget, so a paywalled source fails closed rather than being paid for.
+    const fetchImpl = (async () =>
+      new Response(
+        JSON.stringify(
+          statusEnvelope({
+            collection: "c1",
+            model: "@cf/baai/bge-m3",
+            pages: 0,
+            chunks: 0,
+            created_at: "2026-08-01T00:00:00.000Z",
+            expires_at: "2026-09-01T00:00:00.000Z",
+            job: {
+              pages_done: 3,
+              pages_total: 3,
+              state: "complete",
+              pages_ok: 0,
+              pages_failed: 3,
+              failures: [
+                { url: "https://paywalled.test/a", reason: "upstream_status_402" },
+                { url: "https://thin.test/b", reason: "thin_content" },
+                { url: null, reason: "no_chunks" },
+              ],
+              stopped: "collection_full",
+            },
+          }),
+        ),
+        { status: 200 },
+      )) as unknown as typeof fetch;
+    const client = new AgentRag({ signer, endpoint, fetchImpl });
+
+    const result = await client.status("c1");
+    expect(result.job?.pages_ok).toBe(0);
+    expect(result.job?.pages_failed).toBe(3);
+    expect(result.job?.stopped).toBe("collection_full");
+    // A null url (a document ingested without one) must survive rather than be dropped.
+    expect(result.job?.failures).toEqual([
+      { url: "https://paywalled.test/a", reason: "upstream_status_402" },
+      { url: "https://thin.test/b", reason: "thin_content" },
+      { url: null, reason: "no_chunks" },
+    ]);
+  });
+
+  it("parses a PRE-detail job block unchanged — the fields are optional, not assumed", async () => {
+    // Collections whose job row predates these fields are still live and there is no
+    // migration for them. A client that assumed the fields would read `undefined` as 0
+    // and report a clean run as a total failure, which is worse than saying nothing.
+    const fetchImpl = (async () =>
+      new Response(
+        JSON.stringify(
+          statusEnvelope({
+            collection: "c1",
+            model: "@cf/baai/bge-m3",
+            pages: 2,
+            chunks: 8,
+            created_at: "2026-08-01T00:00:00.000Z",
+            expires_at: "2026-09-01T00:00:00.000Z",
+            job: { pages_done: 2, pages_total: 2, state: "complete" },
+          }),
+        ),
+        { status: 200 },
+      )) as unknown as typeof fetch;
+    const client = new AgentRag({ signer, endpoint, fetchImpl });
+
+    const result = await client.status("c1");
+    expect(result.job).toEqual({ pages_done: 2, pages_total: 2, state: "complete" });
+    expect(result.job?.pages_ok).toBeUndefined();
+    expect(result.job?.failures).toBeUndefined();
+  });
+
   it("a collection with no active job reports `job` as undefined, not misread as running", async () => {
     const fetchImpl = (async () =>
       new Response(

@@ -2,28 +2,27 @@ import type { Signer, UsageBlock } from "@agentx402-ai/core";
 
 export type { Signer, UsageBlock };
 
-// WORKAROUND FOR A REAL VERSION SKEW (tracked in the task list as "Release core 0.4.0
-// (breakdown/expiring_soon)", owner-gated; confirmed independently by the controller, who
-// verified the installed node_modules/@agentx402-ai/core/dist/index.d.ts directly): the
-// PUBLISHED @agentx402-ai/core@0.3.0 predates the commit that added
-// `breakdown`/`expiring_soon` to UsageBlock on core's own main branch — core's
-// package.json was never bumped off 0.3.0, so npm's 0.3.0 lacks fields core's own source
-// already carries. The service genuinely emits a breakdown leg on a composite ask (the
-// worker's ask route wraps its response in `withBreakdown`), so the client must model it
-// today rather than wait for the release. `UsageBlock` above stays a PLAIN, unmodified
-// re-export of core's own type (for compatibility with anything typed against core
-// directly); `RagUsageBlock` below is an ADDITIONAL, superset export — extended, never
-// redeclared, so the two cannot drift — used wherever this SDK's own wire responses
-// actually carry the two fields.
+// HISTORY (the skew this worked around is now RESOLVED): `breakdown`/`expiring_soon` once
+// existed on core's main branch but not in any published core, because core's package.json
+// was never bumped off 0.3.0 — so npm's 0.3.0 lacked fields core's own source already
+// carried. The service genuinely emits a breakdown leg on a composite ask (the worker's ask
+// route wraps its response in `withBreakdown`), so this SDK modelled them itself rather than
+// wait. Core 0.4.0 shipped both fields natively on 2026-08-08 and this package's dependency
+// floor is now `^0.4.0`, so the skew is gone.
+//
+// `UsageBlock` above stays a PLAIN, unmodified re-export of core's own type (for
+// compatibility with anything typed against core directly); `RagUsageBlock` below is an
+// ADDITIONAL, superset export — extended, never redeclared, so the two cannot drift.
 //
 // `RagUsageBlock` IS PART OF THIS PACKAGE'S PUBLIC API, permanently, not a temporary type
 // to delete later — deleting a publicly exported interface is a semver-major break for
 // anyone who imported it, so that was never a safe "eventual cleanup" to promise (an
-// earlier version of this comment did, incorrectly). What DOES change once core ships
-// 0.4.0 with these fields natively: `RagUsageBlock` simplifies to a plain alias
-// (`export type RagUsageBlock = UsageBlock;`), which is NOT a breaking change for any
-// consumer — a type alias to a structurally-identical shape is fully transparent to
-// existing imports of the name.
+// earlier version of this comment did, incorrectly). Now that 0.4.0 is the floor it CAN
+// simplify to a plain alias (`export type RagUsageBlock = UsageBlock;`), which is not a
+// breaking change for any consumer — a type alias to a structurally-identical shape is
+// fully transparent to existing imports of the name. Left as-is here deliberately: that is
+// a type change, and it belongs in its own review rather than riding along with an
+// unrelated wire addition.
 interface RagUsageBlock extends UsageBlock {
   /**
    * Composite-op itemization: additional charge legs beyond the primary verb (e.g. an
@@ -89,14 +88,56 @@ export interface RagChunk {
   position: number;
 }
 
+/** One page that did not make it into the collection. */
+export interface RagPageFailure {
+  /** The page's url, or `null` for a document ingested without one. */
+  url: string | null;
+  /**
+   * Why it failed. A free-form, OPEN set — `upstream_status_402` (a toll-gated
+   * source: AgentRAG fetches through AgentScout with no toll budget, so a paywalled
+   * page fails closed rather than being paid for), `thin_content`, `no_chunks`,
+   * `fetch_failed:*`. Deliberately not one of the `RagErrorCode` values: this
+   * describes one page's fate, not the request's outcome. Match on it with `startsWith`
+   * rather than equality, and never exhaustively.
+   */
+  reason: string;
+}
+
+/**
+ * The failure-shaped half of any ingest progress report. Shared by all three surfaces
+ * that carry one — `AskResult.ingest`, `AskPending`, `CollectionStatus.job` — because
+ * the server projects all three from a single mapping and the client should not
+ * hand-roll three copies that can drift apart.
+ *
+ * Every field is optional: a collection whose job predates these fields still returns a
+ * progress block without them, and no migration exists (or is possible) for it.
+ */
+export interface IngestFailureDetail {
+  /** Pages successfully indexed. `pages_done` counts pages ATTEMPTED, so this is what
+   * distinguishes "50 ingested" from "50 attempted, every one failed". */
+  pages_ok?: number;
+  pages_failed?: number;
+  /**
+   * Per-page reasons, capped server-side at 20 across the whole job. `pages_failed`
+   * stays the authoritative count — on a large wholesale failure this array is SHORTER
+   * than it, so never read `failures.length` as the number of failures.
+   */
+  failures?: RagPageFailure[];
+  /**
+   * Set when the run stopped before exhausting its input. The two values imply opposite
+   * fixes: `collection_full` means resubmit smaller or `extend()`; `collection_expired`
+   * means re-ingest from scratch.
+   */
+  stopped?: "collection_full" | "collection_expired";
+}
+
 /** Ingest progress snapshot — surfaced inline on `AskResult.ingest` (a background top-up
- * observed alongside an answer) and standalone via `CollectionStatus.job`. */
-export interface IngestProgress {
+ * observed alongside an answer), and mirrored field-for-field by `CollectionStatus.job`
+ * and `AskPending`. */
+export interface IngestProgress extends IngestFailureDetail {
   status: string;
   pages_done?: number;
   pages_total?: number;
-  pages_ok?: number;
-  pages_failed?: number;
 }
 
 export interface AskOptions {
@@ -139,7 +180,7 @@ export interface AskResult {
 
 /** A 202 response: the collection is still being ingested. Not an error — poll `status()` or
  * use `askAndWait`. */
-export interface AskPending {
+export interface AskPending extends IngestFailureDetail {
   collection: string;
   status: "ingesting";
   pages_done: number;
@@ -213,7 +254,7 @@ export interface CollectionStatus {
   chunks: number;
   created_at: string;
   expires_at: string;
-  job?: {
+  job?: IngestFailureDetail & {
     pages_done: number;
     pages_total: number;
     state: "running" | "complete" | "failed";

@@ -1,6 +1,6 @@
 {
   "name": "@agentrag/cli",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "AgentRAG CLI + `agentrag mcp` MCP server.",
   "license": "MIT",
   "repository": {
@@ -28,7 +28,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@agentrag/client": "^0.1.1",
+    "@agentrag/client": "^0.1.2",
     "@modelcontextprotocol/sdk": "^1.30.0",
     "viem": "^2.55.10",
     "zod": "^3.25.76"
