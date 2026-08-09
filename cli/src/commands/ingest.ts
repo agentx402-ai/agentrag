@@ -7,6 +7,7 @@ import { EXIT, printError, printJson, type Writer } from "../output";
 // satisfy, instead of erasing the seam with `as never`/`as any`.
 export type IngestClient = {
   ingest: (o: IngestOptions) => Promise<unknown>;
+  ingestAndWait: (o?: IngestOptions) => Promise<unknown>;
 };
 
 /**
@@ -38,7 +39,9 @@ function loadDocuments(path: string): IngestDocument[] {
 }
 
 /** The validated result of parseIngestArgs: either ready-to-send opts, or a usage-error message. */
-export type IngestArgs = { ok: true; opts: IngestOptions } | { ok: false; message: string };
+export type IngestArgs =
+  | { ok: true; opts: IngestOptions; wait: boolean }
+  | { ok: false; message: string };
 
 /**
  * Parse and validate `ingest`'s own arguments — no client, no network. See parseAskArgs's doc
@@ -56,6 +59,7 @@ export function parseIngestArgs(args: string[]): IngestArgs {
     model?: IngestOptions["model"];
     maxPages?: number;
     refresh?: boolean;
+    wait?: boolean;
   };
   let documents: IngestDocument[] | undefined;
   if (f.documents !== undefined) {
@@ -68,6 +72,7 @@ export function parseIngestArgs(args: string[]): IngestArgs {
   }
   return {
     ok: true,
+    wait: !!f.wait,
     opts: {
       sources: f.sources,
       documents,
@@ -88,7 +93,9 @@ export async function runIngest(
     printError(io.stderr, "usage", parsed.message);
     return EXIT.USAGE;
   }
-  const result = await io.client.ingest(parsed.opts);
+  const result = parsed.wait
+    ? await io.client.ingestAndWait(parsed.opts)
+    : await io.client.ingest(parsed.opts);
   printJson(io.stdout, result);
   return EXIT.OK;
 }

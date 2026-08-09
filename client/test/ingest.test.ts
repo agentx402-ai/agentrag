@@ -42,6 +42,13 @@ function ingestEnvelope(
   return { data, ...extra };
 }
 
+/** A worker-shaped collection-status 200 envelope (free route: no `usage`) — same shape as
+ * ask.test.ts's own statusEnvelope helper, duplicated here rather than shared/imported since
+ * neither test file exports fixtures across the other (each stays self-contained). */
+function statusEnvelope(data: Record<string, unknown>, requestId = "r-status") {
+  return { data, request_id: requestId };
+}
+
 describe("ingest: client-side validation runs BEFORE any request", () => {
   it("101 documents throws invalid_request with NO request issued", async () => {
     const fetchImpl = vi.fn();
@@ -483,4 +490,210 @@ describe("ingest: composite authorized ceiling (money-safety)", () => {
     expect(signed).toBe(true);
     expect("chunks" in result).toBe(true);
   });
+});
+
+describe("ingestAndWait", () => {
+  it("rejects an invalid maxWaitMs BEFORE issuing any request", async () => {
+    const fetchImpl = vi.fn();
+    const client = new AgentRag({
+      accountKey: AK,
+      endpoint,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    await expect(
+      client.ingestAndWait({ sources: ["https://a.com"], maxWaitMs: Number.NaN }),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+    await expect(
+      client.ingestAndWait({ sources: ["https://a.com"], maxWaitMs: 0 }),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("returns the sync IngestResult untouched when ingest resolves inline (no 202) — never polls", async () => {
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify(
+            ingestEnvelope({
+              collection: "c6",
+              status: "complete",
+              pages_total: 1,
+              pages_failed: 0,
+              chunks: 2,
+              expires_at: "2026-09-01T00:00:00.000Z",
+            }),
+          ),
+          { status: 200 },
+        ),
+    ) as unknown as typeof fetch;
+    const client = new AgentRag({ accountKey: AK, endpoint, fetchImpl });
+
+    const result = await client.ingestAndWait({ sources: ["https://a.com"] });
+    expect(result).toMatchObject({
+      collection: "c6",
+      status: "complete",
+      pages_total: 1,
+      pages_failed: 0,
+      chunks: 2,
+    });
+    // No 202 -> no poll, no second ingest. Exactly the one bearer call.
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("polls until the job leaves 'running', then assembles an IngestResult from the 202 and the terminal status — and never re-ingests (no double charge)", async () => {
+    const calls: Array<{ method: string; url: string }> = [];
+    let step = 0;
+    const fetchImpl = (async (input: unknown, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : (input as Request).url;
+      const method = init?.method ?? "GET";
+      calls.push({ method, url });
+      step++;
+      if (step === 1) {
+        // ingest() -> still ingesting. Its charge has already settled (usage present).
+        return new Response(
+          JSON.stringify(
+            ingestEnvelope(
+              {
+                collection: "c9",
+                status: "ingesting",
+                pages_done: 0,
+                pages_total: 5,
+                retry_after: 0,
+              },
+              {
+                usage: {
+                  service: "rag",
+                  op: "ingest",
+                  price_usd: 0.025,
+                  list_price_usd: 0.025,
+                  credits_charged: 0,
+                },
+                request_id: "r-ingest",
+              },
+            ),
+          ),
+          { status: 202 },
+        );
+      }
+      if (step === 2) {
+        // first poll (pollIngestJobState) -> still running
+        return new Response(
+          JSON.stringify(
+            statusEnvelope({
+              collection: "c9",
+              model: "@cf/baai/bge-m3",
+              pages: 3,
+              chunks: 0,
+              created_at: "2026-08-01T00:00:00.000Z",
+              expires_at: "2026-09-01T00:00:00.000Z",
+              job: { pages_done: 3, pages_total: 5, state: "running" },
+            }),
+          ),
+          { status: 200 },
+        );
+      }
+      // second poll (pollIngestJobState observes terminal) AND the one additional status()
+      // read afterwards both see the same terminal snapshot — carries the failure detail
+      // ingestAndWait must surface (pages_ok/pages_failed/failures/refunded_credits).
+      return new Response(
+        JSON.stringify(
+          statusEnvelope({
+            collection: "c9",
+            model: "@cf/baai/bge-m3",
+            pages: 5,
+            chunks: 12,
+            created_at: "2026-08-01T00:00:00.000Z",
+            expires_at: "2026-09-05T00:00:00.000Z",
+            job: {
+              pages_done: 5,
+              pages_total: 5,
+              state: "failed",
+              pages_ok: 3,
+              pages_failed: 2,
+              failures: [{ url: "https://a.com/p4", reason: "thin_content" }],
+              refunded_credits: 10,
+            },
+          }),
+        ),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+    const client = new AgentRag({ accountKey: AK, endpoint, fetchImpl });
+
+    const result = await client.ingestAndWait({
+      sources: ["https://a.com/**"],
+      pollIntervalMs: 0,
+      maxWaitMs: 5_000,
+    });
+
+    expect(step).toBe(4); // POST ingest -> GET poll(running) -> GET poll(terminal) -> GET status
+    expect(result).toMatchObject({
+      collection: "c9",
+      status: "failed",
+      pages_total: 5, // from the 202
+      pages_ok: 3, // from the terminal job block
+      pages_failed: 2,
+      refunded_credits: 10,
+      chunks: 12, // from the terminal status(), not the 202
+      expires_at: "2026-09-05T00:00:00.000Z",
+      request_id: "r-ingest", // from the 202 — the only response carrying it
+      usage: { service: "rag", op: "ingest", price_usd: 0.025 },
+    });
+    expect(result.failures).toHaveLength(1);
+    expect(result.failures?.[0]).toMatchObject({ reason: "thin_content" });
+
+    // The money-safety assertion: exactly ONE POST to /v1/rag/ingest across the whole
+    // call. Re-issuing ingest() after the wait would double-charge for work already paid
+    // for — see ingestAndWait's own doc comment.
+    const ingestPosts = calls.filter(
+      (c) => c.method === "POST" && c.url === `${endpoint}/v1/rag/ingest`,
+    );
+    expect(ingestPosts).toHaveLength(1);
+    expect(calls.map((c) => c.method)).toEqual(["POST", "GET", "GET", "GET"]);
+  });
+
+  it("throws ingest_timeout once maxWaitMs elapses while the job keeps reporting 'running' — and still never re-ingests", async () => {
+    let ingestCalls = 0;
+    const fetchImpl = (async (_input: unknown, init?: RequestInit) => {
+      if ((init?.method ?? "GET") === "POST") {
+        ingestCalls++;
+        return new Response(
+          JSON.stringify(
+            ingestEnvelope({
+              collection: "c9",
+              status: "ingesting",
+              pages_done: 0,
+              pages_total: 5,
+              retry_after: 0,
+            }),
+          ),
+          { status: 202 },
+        );
+      }
+      return new Response(
+        JSON.stringify(
+          statusEnvelope({
+            collection: "c9",
+            model: "@cf/baai/bge-m3",
+            pages: 0,
+            chunks: 0,
+            created_at: "2026-08-01T00:00:00.000Z",
+            expires_at: "2026-09-01T00:00:00.000Z",
+            job: { pages_done: 0, pages_total: 5, state: "running" },
+          }),
+        ),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+    const client = new AgentRag({ accountKey: AK, endpoint, fetchImpl });
+
+    await expect(
+      client.ingestAndWait({
+        sources: ["https://a.com/**"],
+        pollIntervalMs: 5,
+        maxWaitMs: 30,
+      }),
+    ).rejects.toMatchObject({ code: "ingest_timeout" });
+    expect(ingestCalls).toBe(1); // one paid ingest call, never repeated on timeout
+  }, 2_000);
 });

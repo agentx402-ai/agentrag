@@ -78,6 +78,7 @@ export const INGEST_FLAGS: ReadonlySet<string> = new Set([
   "model",
   "max-pages",
   "refresh",
+  "wait",
 ]);
 export const EXTEND_FLAGS: ReadonlySet<string> = new Set([...GLOBAL_FLAGS, "days"]);
 export const STATUS_FLAGS: ReadonlySet<string> = new Set(GLOBAL_FLAGS);

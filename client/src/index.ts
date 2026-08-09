@@ -272,8 +272,10 @@ function assertValidDocuments(documents: IngestDocument[]): void {
   });
 }
 
-/** Type guard distinguishing a 202 (`AskPending`) from a settled `AskResult`. */
-function isAskPending(result: AskResult | AskPending): result is AskPending {
+/** Type guard distinguishing a 202 (`AskPending`) from a settled `AskResult`/`IngestResult` —
+ * shared by `askAndWait` and `ingestAndWait`, since `ask()` and `ingest()` both resolve to
+ * `AskPending` on a 202. */
+function isAskPending(result: AskResult | IngestResult | AskPending): result is AskPending {
   return (result as AskPending).status === "ingesting";
 }
 
@@ -967,6 +969,119 @@ export class AgentRag {
         };
       },
     });
+  }
+
+  /**
+   * `ingest`, but transparently waits out a 202 instead of returning `AskPending` —
+   * assembles a full `IngestResult` from the job's terminal state instead of re-issuing
+   * the ingest.
+   *
+   * This is where it must DIFFER from `askAndWait`, and why: `askAndWait` re-asks after
+   * its wait because `ask`'s 202 carries no answer yet — nothing to lose by asking again.
+   * `ingest`'s 202 is different: the charge has ALREADY settled by the time it's returned
+   * (`ingest`'s 202, unlike `ask`'s, sends `usage` — see `AskPending`'s own doc comment for
+   * why), and the ingest itself is already running server-side. Re-issuing `ingest()` once
+   * the wait ends would not resume anything; it would start a SECOND ingest and bill a
+   * SECOND time for work already paid for once. So once the job leaves "running", the
+   * ingest is DONE — complete or failed, refund included — and this method's only job is
+   * to report that outcome, never to repeat the call.
+   *
+   * Reporting the outcome needs one more read than `askAndWait` does: `pollIngestJobState`
+   * (the same minimal internal helper `askAndWait` uses) exposes only the job's `state`,
+   * not `chunks`/`expires_at`/the rest of the `job` block. So once polling observes a
+   * non-"running" state, this makes exactly ONE additional `status()` call and assembles
+   * an `IngestResult` from BOTH responses: the payment-bearing fields (`collection`,
+   * `usage`, `settledTxHash`, `creditsRemaining`, `request_id`, `pages_total`) come from
+   * the 202 — the ONLY response here that carries them, since `ingest`'s charge settles
+   * before it returns — while the outcome fields (`chunks`, `expires_at`, `status`, and the
+   * `job`'s own progress detail: `pages_ok`, `pages_failed`, `failures`, `stopped`,
+   * `refunded_credits`) come from the terminal `status()` read.
+   *
+   * Throws `ingest_timeout` at `maxWaitMs` (default `DEFAULT_ASK_WAIT_MS`, shared with
+   * `askAndWait` — this wait has no reason to default differently). The job keeps running
+   * server-side regardless — and, unlike a timed-out `askAndWait`, its charge has already
+   * settled either way — so a timeout here loses patience, not the ingest and not the
+   * money. `pollIntervalMs`, when omitted, defaults to the 202's own `retry_after`
+   * (falling back to `DEFAULT_ASK_POLL_INTERVAL_MS` if that is missing or non-positive).
+   */
+  async ingestAndWait(
+    opts: IngestOptions & { maxWaitMs?: number; pollIntervalMs?: number } = {},
+  ): Promise<IngestResult> {
+    const { maxWaitMs, pollIntervalMs, ...ingestOpts } = opts;
+    // Same validation as askAndWait, for the same reason (see its own I1 comment): an
+    // unvalidated maxWaitMs/pollIntervalMs poisons the deadline/interval math into an
+    // unbounded, zero-delay poll loop. Checked BEFORE the first ingest() call, like every
+    // other bound in this SDK.
+    if (maxWaitMs !== undefined && !(Number.isFinite(maxWaitMs) && maxWaitMs > 0)) {
+      throw new AgentRagError(
+        `maxWaitMs must be a finite positive number of milliseconds (got ${maxWaitMs})`,
+        "invalid_request",
+        0,
+      );
+    }
+    // pollIntervalMs: 0 is deliberately VALID (poll immediately, no backoff) — only
+    // non-finite or negative values are rejected.
+    if (pollIntervalMs !== undefined && !(Number.isFinite(pollIntervalMs) && pollIntervalMs >= 0)) {
+      throw new AgentRagError(
+        `pollIntervalMs must be a finite non-negative number of milliseconds (got ${pollIntervalMs})`,
+        "invalid_request",
+        0,
+      );
+    }
+    const deadline = Date.now() + (maxWaitMs ?? DEFAULT_ASK_WAIT_MS);
+
+    const result = await this.ingest(ingestOpts);
+    if (!isAskPending(result)) return result;
+
+    const { collection } = result;
+    const serverIntervalMs =
+      Number.isFinite(result.retry_after) && result.retry_after > 0
+        ? result.retry_after * 1000
+        : DEFAULT_ASK_POLL_INTERVAL_MS;
+    const interval = Math.max(0, pollIntervalMs ?? serverIntervalMs);
+
+    let jobState: "running" | "complete" | "failed" | undefined;
+    for (;;) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        throw new AgentRagError(
+          `ingest on collection "${collection}" did not finish within maxWaitMs; it may ` +
+            "still complete server-side — the charge has already settled either way",
+          "ingest_timeout",
+          0,
+        );
+      }
+      await sleep(Math.min(interval, remaining));
+      jobState = await this.pollIngestJobState(collection);
+      if (jobState !== "running") break;
+    }
+
+    // The job is done — do NOT re-ingest (see doc comment above: that would double-charge
+    // for work already paid for). One more status() read for the fields
+    // pollIngestJobState doesn't expose, then assemble from both responses.
+    const finalStatus = await this.status(collection);
+    return {
+      collection: result.collection,
+      // finalStatus.job should always be present here — pollIngestJobState just observed
+      // a terminal state for this very collection — but the type allows a status read
+      // with no job block at all, so fall back to the state this loop itself just
+      // observed, and only then to a pessimistic "failed" rather than fabricate success.
+      status: finalStatus.job?.state ?? jobState ?? "failed",
+      pages_total: result.pages_total,
+      // Optional on IngestFailureDetail for the same old-deployment reason documented on
+      // IngestResult itself; 0 only when the terminal job report omits it.
+      pages_failed: finalStatus.job?.pages_failed ?? 0,
+      pages_ok: finalStatus.job?.pages_ok,
+      failures: finalStatus.job?.failures,
+      stopped: finalStatus.job?.stopped,
+      refunded_credits: finalStatus.job?.refunded_credits,
+      chunks: finalStatus.chunks,
+      expires_at: finalStatus.expires_at,
+      usage: result.usage,
+      request_id: result.request_id,
+      settledTxHash: result.settledTxHash,
+      creditsRemaining: result.creditsRemaining,
+    };
   }
 
   /**

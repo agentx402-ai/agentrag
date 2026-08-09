@@ -51,6 +51,10 @@ function fakeClient(seen: Record<string, unknown> = {}): McpClient {
       seen.ingest = o;
       return INGEST_RESULT;
     },
+    ingestAndWait: async (o) => {
+      seen.ingestAndWait = o;
+      return INGEST_RESULT;
+    },
     extend: async (collection, days) => {
       seen.extend = { collection, days };
       return EXTEND_RESULT;
@@ -201,10 +205,21 @@ describe("agentrag mcp tools", () => {
       { sources: ["https://ex.com/**"], model: "@cf/baai/bge-m3" },
       {},
     );
+    expect(seen.ingestAndWait).toBeUndefined();
     expect(seen.ingest).toMatchObject({
       sources: ["https://ex.com/**"],
       model: "@cf/baai/bge-m3",
     });
+  });
+
+  it("rag_ingest calls client.ingestAndWait when wait:true", async () => {
+    const seen: Record<string, unknown> = {};
+    await tools(fakeClient(seen)).rag_ingest.handler(
+      { sources: ["https://ex.com/**"], wait: true },
+      {},
+    );
+    expect(seen.ingest).toBeUndefined();
+    expect(seen.ingestAndWait).toMatchObject({ sources: ["https://ex.com/**"] });
   });
 
   it("rag_extend forwards collection + days to client.extend", async () => {
