@@ -2,6 +2,34 @@
 
 All notable changes to this project are documented here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project adheres to [SemVer](https://semver.org/).
 
+## [0.1.5] — 2026-08-09
+
+### Added
+
+- **`ingestAndWait()`** — resolves an async ingest and returns a normal `IngestResult`, the
+  same way `askAndWait()` already did for `ask`. Also `--wait` on `agentrag ingest`, and a
+  `wait` parameter on the `rag_ingest` MCP tool.
+
+  `ask` had an await affordance on all three surfaces and `ingest` had none — on the verb
+  that actually runs long. An `ask` is usually instant; its async path only fires when it has
+  to ingest first. An `ingest` over a crawl root can take minutes, and every caller was left
+  to hand-roll the poll loop from a `202`.
+
+- **`IngestResult` now declares `pages_ok`, `failures`, `stopped` and `refunded_credits`**
+  (via `IngestFailureDetail`). The service has sent them on the ingest `200` since the
+  failure-reason release; the type simply had not caught up, so they were unreachable from
+  TypeScript.
+
+### Notes
+
+- **`ingestAndWait` never re-issues the ingest.** Unlike `askAndWait` — which must re-ask,
+  because its `202` carried no answer — the ingest is already finished when the job leaves
+  `running`. Re-issuing it would be a second charge for work already paid for. The result is
+  assembled from the `202` (which carries `usage`) plus one free `status()` read, and a test
+  counts the ingest requests to keep it that way.
+- Timeouts behave like `askAndWait`'s: `ingest_timeout` means patience ran out, not the
+  ingest. The job keeps running server-side and stays readable through `status()`.
+
 ## [0.1.4] — 2026-08-09
 
 Housekeeping. No wire changes, no behavior changes, no new fields.
