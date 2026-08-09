@@ -192,6 +192,76 @@ describe("status()", () => {
     ]);
   });
 
+  it("reports refunded_credits on a FAILED job, so a caller who paid can see they were made whole", async () => {
+    // A job that dies after starting now refunds its unspent budget
+    // automatically (worker issue #60). 5 charged, 1 indexed, 4 refunded at 50
+    // credits each. Before that fix the caller kept the loss; before this
+    // release they could not see the refund without reading their balance.
+    const fetchImpl = (async () =>
+      new Response(
+        JSON.stringify(
+          statusEnvelope({
+            collection: "c1",
+            model: "@cf/baai/bge-m3",
+            pages: 1,
+            chunks: 4,
+            created_at: "2026-08-01T00:00:00.000Z",
+            expires_at: "2026-09-01T00:00:00.000Z",
+            job: {
+              pages_done: 1,
+              pages_total: 5,
+              state: "failed",
+              pages_ok: 1,
+              pages_failed: 0,
+              refunded_credits: 200,
+            },
+          }),
+        ),
+        { status: 200 },
+      )) as unknown as typeof fetch;
+    const client = new AgentRag({ signer, endpoint, fetchImpl });
+
+    const result = await client.status("c1");
+    expect(result.job?.state).toBe("failed");
+    expect(result.job?.refunded_credits).toBe(200);
+  });
+
+  it("distinguishes refunded_credits 0 from an older service that cannot say", async () => {
+    // 0 means nothing was owed back. Absent means the service predates the
+    // field. Collapsing them would tell a caller "you were refunded nothing"
+    // when the truth is "unknown".
+    const mk = (job: Record<string, unknown>) =>
+      (async () =>
+        new Response(
+          JSON.stringify(
+            statusEnvelope({
+              collection: "c1",
+              model: "@cf/baai/bge-m3",
+              pages: 2,
+              chunks: 8,
+              created_at: "2026-08-01T00:00:00.000Z",
+              expires_at: "2026-09-01T00:00:00.000Z",
+              job,
+            }),
+          ),
+          { status: 200 },
+        )) as unknown as typeof fetch;
+
+    const zero = await new AgentRag({
+      signer,
+      endpoint,
+      fetchImpl: mk({ pages_done: 2, pages_total: 2, state: "complete", refunded_credits: 0 }),
+    }).status("c1");
+    expect(zero.job?.refunded_credits).toBe(0);
+
+    const silent = await new AgentRag({
+      signer,
+      endpoint,
+      fetchImpl: mk({ pages_done: 2, pages_total: 2, state: "complete" }),
+    }).status("c1");
+    expect(silent.job?.refunded_credits).toBeUndefined();
+  });
+
   it("parses a PRE-detail job block unchanged — the fields are optional, not assumed", async () => {
     // Collections whose job row predates these fields are still live and there is no
     // migration for them. A client that assumed the fields would read `undefined` as 0

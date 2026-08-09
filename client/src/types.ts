@@ -118,6 +118,20 @@ export interface IngestFailureDetail {
   pages_ok?: number;
   pages_failed?: number;
   /**
+   * Credits minted back for pages that were charged but never indexed.
+   *
+   * Present on BOTH terminal states. On a FAILED job that is the point: an
+   * ingest that dies after starting refunds its unspent budget automatically,
+   * and a caller who paid should see that rather than infer it from a balance.
+   *
+   * Credits, not USDC — a caller who paid in USDC is made whole in store credit
+   * at the rate their charge actually settled through.
+   *
+   * `0` means nothing was owed back (every charged page was indexed). Absent
+   * means an older service that cannot say — the two are different answers.
+   */
+  refunded_credits?: number;
+  /**
    * Per-page reasons, capped server-side at 20 across the whole job. `pages_failed`
    * stays the authoritative count — on a large wholesale failure this array is SHORTER
    * than it, so never read `failures.length` as the number of failures.

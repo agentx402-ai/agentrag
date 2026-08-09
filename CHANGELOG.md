@@ -2,6 +2,27 @@
 
 All notable changes to this project are documented here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project adheres to [SemVer](https://semver.org/).
 
+## [0.1.3] — 2026-08-09
+
+### Added
+
+- **`refunded_credits` on ingest progress.** Credits minted back for pages that were charged
+  but never indexed, present on both terminal states.
+
+  It is on the **failed** state that this matters. An ingest that dies after starting now
+  refunds its unspent budget automatically, where previously the caller kept the entire charge
+  until an operator intervened. A caller who paid should be able to see that they were made
+  whole rather than infer it from a balance.
+
+### Notes
+
+- **Credits, not USDC.** A caller who paid in USDC is made whole in store credit, at the rate
+  their charge actually settled through.
+- **`0` and absent mean different things.** `0` is "nothing was owed back" — every charged page
+  was indexed. Absent is an older service that cannot say. Do not collapse them; reporting
+  "refunded nothing" when the truth is "unknown" is worse than reporting nothing.
+- Requires the AgentRAG service deployed 2026-08-09 or later.
+
 ## [0.1.2] — 2026-08-08
 
 ### Added
