@@ -2,7 +2,7 @@
   "mcpServers": {
     "agentrag": {
       "command": "npx",
-      "args": ["-y", "@agentrag/cli@0.1.2", "mcp"],
+      "args": ["-y", "@agentrag/cli@0.1.3", "mcp"],
       "env": {
         "AGENTRAG_ENDPOINT": "${user_config.endpoint:-}",
         "AGENTRAG_PRIVATE_KEY": "${user_config.private_key:-}",
