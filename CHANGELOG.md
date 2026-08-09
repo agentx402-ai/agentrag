@@ -2,6 +2,29 @@
 
 All notable changes to this project are documented here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project adheres to [SemVer](https://semver.org/).
 
+## [0.1.4] — 2026-08-09
+
+Housekeeping. No wire changes, no behavior changes, no new fields.
+
+### Changed
+
+- **`RagUsageBlock` is now a plain alias for `UsageBlock`.** It began as a superset because
+  `breakdown` and `expiring_soon` existed on core's main branch but not in any published
+  core. Core 0.4.0 shipped both natively and this package's floor is already `^0.4.0`, so the
+  superset had nothing left to add — verified field-for-field against the installed core,
+  including that `expiring_soon` is the literal `true` type rather than `boolean`.
+
+  Not a breaking change: the name never carried an `export`, so no consumer could import it;
+  it reaches callers only structurally, through `AskResult["usage"]` and friends. AgentScout
+  and AgentKV both re-export core's `UsageBlock` directly, and AgentRAG was the last client
+  still carrying a local superset.
+
+- **`RagPageFailure.reason` is documented more precisely.** It previously read "a free-form,
+  OPEN set" while the service called the same thing "a closed vocabulary" — a contradiction
+  in wording, though both gave the same advice. Neither was quite right: the *categories* are
+  closed, but `upstream_status_<code>` and `fetch_failed:<detail>` carry variable suffixes, so
+  the concrete strings are not. Hence `startsWith`, never an exhaustive `switch`.
+
 ## [0.1.3] — 2026-08-09
 
 ### Added
