@@ -2,44 +2,27 @@ import type { Signer, UsageBlock } from "@agentx402-ai/core";
 
 export type { Signer, UsageBlock };
 
-// HISTORY (the skew this worked around is now RESOLVED): `breakdown`/`expiring_soon` once
-// existed on core's main branch but not in any published core, because core's package.json
-// was never bumped off 0.3.0 — so npm's 0.3.0 lacked fields core's own source already
-// carried. The service genuinely emits a breakdown leg on a composite ask (the worker's ask
-// route wraps its response in `withBreakdown`), so this SDK modelled them itself rather than
-// wait. Core 0.4.0 shipped both fields natively on 2026-08-08 and this package's dependency
-// floor is now `^0.4.0`, so the skew is gone.
+// `RagUsageBlock` is now a plain alias for core's `UsageBlock`.
 //
-// `UsageBlock` above stays a PLAIN, unmodified re-export of core's own type (for
-// compatibility with anything typed against core directly); `RagUsageBlock` below is an
-// ADDITIONAL, superset export — extended, never redeclared, so the two cannot drift.
+// It began as a superset: `breakdown`/`expiring_soon` existed on core's main branch but not
+// in any PUBLISHED core, because core's package.json was never bumped off 0.3.0. The service
+// genuinely emits a breakdown leg on a composite ask, so this SDK modelled the two fields
+// itself rather than wait. Core 0.4.0 shipped both natively on 2026-08-08 and this package's
+// floor is `^0.4.0`, so the superset had nothing left to add — verified field-for-field
+// against the installed core: `breakdown?: Array<{op, units, price_usd}>` and
+// `expiring_soon?: true` (the literal type, not `boolean`).
 //
-// `RagUsageBlock` IS PART OF THIS PACKAGE'S PUBLIC API, permanently, not a temporary type
-// to delete later — deleting a publicly exported interface is a semver-major break for
-// anyone who imported it, so that was never a safe "eventual cleanup" to promise (an
-// earlier version of this comment did, incorrectly). Now that 0.4.0 is the floor it CAN
-// simplify to a plain alias (`export type RagUsageBlock = UsageBlock;`), which is not a
-// breaking change for any consumer — a type alias to a structurally-identical shape is
-// fully transparent to existing imports of the name. Left as-is here deliberately: that is
-// a type change, and it belongs in its own review rather than riding along with an
-// unrelated wire addition.
-interface RagUsageBlock extends UsageBlock {
-  /**
-   * Composite-op itemization: additional charge legs beyond the primary verb (e.g. an
-   * AgentRAG ask that also ingested pages). The top-level `price_usd` is the PRIMARY
-   * verb's price on the taken path; the request's total cost is `price_usd` + the sum of
-   * `breakdown[].price_usd`. Absent on single-leg ops — never an empty array on the wire.
-   * Mirrors core's own (unreleased) UsageBlock.breakdown field-for-field.
-   */
-  breakdown?: Array<{ op: string; units: number; price_usd: number }>;
-  /**
-   * Present (always literal `true`, never `false`) when the collection named by this
-   * response is inside the final 24h of its lifetime — the caller's cue to query it
-   * (sliding the expiry) or extend it. Omitted otherwise. Mirrors core's own (unreleased)
-   * UsageBlock.expiring_soon field-for-field.
-   */
-  expiring_soon?: true;
-}
+// Collapsing it is not a breaking change. The name is INTERNAL — it never carried an
+// `export`, so no consumer can have imported it; it reaches them only structurally, through
+// `AskResult["usage"]` and friends. (An earlier version of this comment asserted the
+// opposite — that the name was permanently public API — which was simply wrong about its
+// own file.) An alias to a structurally identical shape is transparent either way.
+//
+// `UsageBlock` above stays a plain, unmodified re-export of core's type. The two names now
+// resolve to the same thing by construction rather than by discipline, which is the point:
+// agentscout and agentkv both re-export core's UsageBlock directly, and AgentRAG was the
+// only client still carrying a local superset.
+type RagUsageBlock = UsageBlock;
 
 /** Embedding model backing a collection. Fixed at collection creation — an `ingest` against
  * an existing collection with a different model is rejected server-side (model_mismatch). */
@@ -93,12 +76,22 @@ export interface RagPageFailure {
   /** The page's url, or `null` for a document ingested without one. */
   url: string | null;
   /**
-   * Why it failed. A free-form, OPEN set — `upstream_status_402` (a toll-gated
-   * source: AgentRAG fetches through AgentScout with no toll budget, so a paywalled
-   * page fails closed rather than being paid for), `thin_content`, `no_chunks`,
-   * `fetch_failed:*`. Deliberately not one of the `RagErrorCode` values: this
-   * describes one page's fate, not the request's outcome. Match on it with `startsWith`
-   * rather than equality, and never exhaustively.
+   * Why it failed.
+   *
+   * The CATEGORIES are a closed list — `thin_content`, `no_chunks`, `body_too_large`,
+   * `collection_expired`, `refresh_delete_failed`, `upstream_status_<code>`,
+   * `fetch_failed:<detail>`, plus one generic token for an internal error (whose message
+   * is deliberately never echoed). The concrete STRINGS are not closed, because the last
+   * two carry a variable suffix.
+   *
+   * So match with `startsWith`, never exhaustively: a `switch` over today's values is
+   * wrong the first time an unusual upstream status appears. This is deliberately NOT one
+   * of the `RagErrorCode` values — it describes one page's fate, not the request's
+   * outcome.
+   *
+   * `upstream_status_402` is worth knowing by name: it means a toll-gated source. AgentRAG
+   * fetches through AgentScout with no toll budget, so a paywalled page fails closed
+   * rather than being paid for.
    */
   reason: string;
 }
