@@ -35,6 +35,9 @@ export type McpClient = {
     o?: AskOptions & { maxWaitMs?: number; pollIntervalMs?: number },
   ) => Promise<AskResult>;
   ingest: (o: IngestOptions) => Promise<IngestResult | AskPending>;
+  ingestAndWait: (
+    o?: IngestOptions & { maxWaitMs?: number; pollIntervalMs?: number },
+  ) => Promise<IngestResult>;
   extend: (collection: string, days: 30 | 60 | 90) => Promise<ExtendResult>;
   status: (collection: string) => Promise<CollectionStatus>;
   delete: (collection: string) => Promise<{ deleted: true }>;
@@ -121,7 +124,9 @@ export function buildMcpServer(deps: { client: McpClient; wallet: WalletIdentity
       "`documents` (text with no URL) into a named collection — the only way to index documents " +
       "directly, or to force a `refresh` re-fetch. SPENDS real USDC/credits, per page/document " +
       "unit ($0.005/page); honors maxSpendUsd/maxSessionSpendUsd. A large source set needs a " +
-      "durable job and resolves as a pending status (not an error); a small one resolves inline.",
+      "durable job and resolves as a pending status (not an error); a small one resolves inline. " +
+      "A job that takes a while resolves as a pending status — set `wait:true` to block until it " +
+      "finishes and get the final page/chunk counts back in one call.",
     {
       sources: z
         .array(z.string().url())
@@ -157,6 +162,12 @@ export function buildMcpServer(deps: { client: McpClient; wallet: WalletIdentity
         .boolean()
         .optional()
         .describe("Force re-ingestion even if the collection already exists"),
+      wait: z
+        .boolean()
+        .optional()
+        .describe(
+          "Block until the ingest job finishes and return the final result, instead of a pending status",
+        ),
     },
     // Paid, and non-destructive for the same reason as rag_ask — see the note there.
     {
@@ -174,7 +185,7 @@ export function buildMcpServer(deps: { client: McpClient; wallet: WalletIdentity
         maxPages: a.max_pages,
         refresh: a.refresh,
       };
-      return text(await client.ingest(opts));
+      return text(a.wait ? await client.ingestAndWait(opts) : await client.ingest(opts));
     },
   );
 

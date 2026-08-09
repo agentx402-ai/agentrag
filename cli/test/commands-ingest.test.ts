@@ -7,10 +7,16 @@ import type { IngestClient } from "../src/commands/ingest";
 import { runIngest } from "../src/commands/ingest";
 
 // Typed directly against the exported IngestClient (the same interface the real AgentRag must
-// satisfy) instead of `as never` — a mistyped override here is now a compile error.
+// satisfy) instead of `as never` — a mistyped override here is now a compile error, and
+// `client.ingest`/`client.ingestAndWait` below are the real vi.fn() mocks, not an erased `any`.
 function fakeClient(over: Partial<IngestClient> = {}) {
   return {
     ingest: vi.fn(async (o?: IngestOptions) => ({
+      collection: "docs",
+      status: "complete",
+      opts: o,
+    })),
+    ingestAndWait: vi.fn(async (o?: IngestOptions) => ({
       collection: "docs",
       status: "complete",
       opts: o,
@@ -130,6 +136,26 @@ describe("ingest command", () => {
     }
   });
 
+  it("--wait calls ingestAndWait instead of ingest", async () => {
+    out = [];
+    err = [];
+    const client = fakeClient();
+    const code = await runIngest(["--sources", "https://ex.com/**", "--wait"], io(client));
+    expect(code).toBe(0);
+    expect(client.ingestAndWait).toHaveBeenCalledTimes(1);
+    expect(client.ingest).not.toHaveBeenCalled();
+  });
+
+  it("without --wait, ingest() is called and ingestAndWait is not", async () => {
+    out = [];
+    err = [];
+    const client = fakeClient();
+    const code = await runIngest(["--sources", "https://ex.com/**"], io(client));
+    expect(code).toBe(0);
+    expect(client.ingest).toHaveBeenCalledTimes(1);
+    expect(client.ingestAndWait).not.toHaveBeenCalled();
+  });
+
   it("prints a 202 AskPending result as-is (a large source set needs a durable job)", async () => {
     out = [];
     err = [];
@@ -146,16 +172,14 @@ describe("ingest command", () => {
   });
 
   // Review Minor: "every command accepts every other command's flags and silently drops them."
-  // --wait/--top-k/--mode are ask-only; --days is extend-only. runIngest itself doesn't catch
-  // parseFlags's UsageError (only runCli's outer try/catch does), so this surfaces as a
-  // rejection when calling runIngest directly, not a return code.
-  it("rejects a flag valid on another command (e.g. --wait, --days) instead of silently dropping it", async () => {
+  // --top-k/--mode are ask-only; --days is extend-only. (--wait is now valid here too — see
+  // the ingestAndWait dispatch tests above — so it's no longer part of this rejection list.)
+  // runIngest itself doesn't catch parseFlags's UsageError (only runCli's outer try/catch
+  // does), so this surfaces as a rejection when calling runIngest directly, not a return code.
+  it("rejects a flag valid on another command (e.g. --days) instead of silently dropping it", async () => {
     out = [];
     err = [];
     const client = fakeClient();
-    await expect(runIngest(["--sources", "https://ex.com", "--wait"], io(client))).rejects.toThrow(
-      /flag --wait is not valid for this command/,
-    );
     await expect(
       runIngest(["--sources", "https://ex.com", "--days", "30"], io(client)),
     ).rejects.toThrow(/flag --days is not valid for this command/);

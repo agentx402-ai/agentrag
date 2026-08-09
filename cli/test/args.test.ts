@@ -132,10 +132,17 @@ describe("per-command flag allowlists", () => {
   });
 
   it("INGEST_FLAGS: the ingest surface plus GLOBAL_FLAGS, and nothing ask/extend-only", () => {
-    for (const f of ["sources", "documents", "collection", "model", "max-pages", "refresh"]) {
+    for (const f of [
+      "sources",
+      "documents",
+      "collection",
+      "model",
+      "max-pages",
+      "refresh",
+      "wait",
+    ]) {
       expect(INGEST_FLAGS.has(f)).toBe(true);
     }
-    expect(INGEST_FLAGS.has("wait")).toBe(false); // ask-only
     expect(INGEST_FLAGS.has("top-k")).toBe(false); // ask-only
     expect(INGEST_FLAGS.has("mode")).toBe(false); // ask-only
     expect(INGEST_FLAGS.has("days")).toBe(false); // extend-only

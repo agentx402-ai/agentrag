@@ -227,7 +227,17 @@ export interface IngestOptions {
   idempotencyKey?: string;
 }
 
-export interface IngestResult {
+/**
+ * Since worker PR #62, `POST /v1/rag/ingest`'s 200 also emits `pages_ok` and
+ * `refunded_credits` unconditionally, and `failures` when non-empty — all three inherited
+ * here from `IngestFailureDetail` rather than redeclared. They stay OPTIONAL on the type
+ * even though the current service always sends `pages_ok`/`refunded_credits`: an older
+ * deployment predates PR #62 and sends neither, and the client has to keep parsing its
+ * response rather than assume a shape that only the newest server guarantees.
+ * `pages_failed` is the one field narrowed to required — the service has sent it since
+ * before this type existed, so there is no old-deployment case to tolerate.
+ */
+export interface IngestResult extends IngestFailureDetail {
   collection: string;
   status: string;
   pages_total: number;

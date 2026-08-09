@@ -16,7 +16,7 @@ const HELP = `agentrag — x402-paid retrieval-augmented generation over your ow
 
 Usage:
   agentrag ask <query> [--sources URL...] [--collection ID] [--top-k N] [--mode hybrid|dense|bm25] [--max-pages N] [--wait]
-  agentrag ingest [--sources URL...] [--documents FILE] [--collection ID] [--model ID] [--max-pages N] [--refresh]
+  agentrag ingest [--sources URL...] [--documents FILE] [--collection ID] [--model ID] [--max-pages N] [--refresh] [--wait]
   agentrag extend <collection> --days 30|60|90
   agentrag status <collection>
   agentrag delete <collection>

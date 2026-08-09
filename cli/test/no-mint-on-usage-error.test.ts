@@ -42,8 +42,10 @@ describe("a usage error never mints a wallet", () => {
       argv: ["ask", "q", "--refresh"],
     },
     {
-      name: "ingest with a flag valid on another command (--wait)",
-      argv: ["ingest", "--sources", "https://ex.example/**", "--wait"],
+      // --wait is now valid on ingest too (ingestAndWait) — --top-k (ask-only) is the
+      // still-invalid flag this case exercises.
+      name: "ingest with a flag valid on another command (--top-k)",
+      argv: ["ingest", "--sources", "https://ex.example/**", "--top-k", "5"],
     },
     {
       name: "status with a flag valid on another command (--top-k)",
