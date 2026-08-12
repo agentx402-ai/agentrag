@@ -2,6 +2,48 @@
 
 All notable changes to this project are documented here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project adheres to [SemVer](https://semver.org/).
 
+## [0.1.6] — 2026-08-12
+
+### Fixed
+
+- **`askAndWait()` and `ingestAndWait()` now wait on YOUR job, not the collection's.** Both
+  polled `status().job` — the collection-wide *display* job, which is whichever ingest the
+  service picks to show, not necessarily the one your call started. A collection can run
+  several ingests at once (one job per distinct spec), so with concurrent ingests against the
+  same collection either method could:
+
+  - **return early on a sibling's completion** — `askAndWait` answering against a collection
+    its own ingest had not finished filling, and `ingestAndWait` reporting another job's
+    `status`, `pages_ok`, `pages_failed`, `failures`, `stopped` and `refunded_credits` as
+    yours, on the very fields you paid to learn; or
+  - **wait forever** — if a sibling job outlived yours, the poll kept seeing `running` past
+    your own job's completion, until `maxWaitMs` expired as a bogus timeout.
+
+  Both now pin every read to the `job_id` their own `202` named. Serial callers were never
+  affected; nothing about the single-ingest path changes.
+
+  If you hand-rolled a poll loop, apply the same fix: match `job_id` from your `202` against
+  `status().jobs[]` rather than reading `status().job`.
+
+### Added
+
+- **`job_id` on `AskPending`** — which ingest job a `202` is about. An `ingest` `202` always
+  carries one; an `ask` `202` only when that ask *created* the job rather than joining one
+  already running.
+- **`jobs[]` on `CollectionStatus`** — every retained job row, most recent first. `job` is the
+  selected element of that list. The row shape is now exported as **`CollectionJob`**, which
+  `job` and `jobs[]` share field-for-field.
+- **`too_many_active_jobs` error code.** A collection caps how many ingest jobs may be in
+  flight at once; an ingest over that cap is refused rather than queued. The service emits it
+  as of today; the type now declares it. Retry once a live job reaches a terminal state (poll
+  `status()`), or ingest into a different collection.
+
+### Notes
+
+- All three additions are optional and backward-compatible in both directions. Against a
+  service too old to name jobs, `job_id` and `jobs[]` are simply absent and both wait methods
+  fall back to exactly their previous display-job behavior.
+
 ## [0.1.5] — 2026-08-09
 
 ### Added

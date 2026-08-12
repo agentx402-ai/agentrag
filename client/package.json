@@ -1,6 +1,6 @@
 {
   "name": "@agentrag/client",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "AgentRAG SDK — x402-paid retrieval over your own documents, for agents.",
   "license": "MIT",
   "repository": {
