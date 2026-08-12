@@ -195,6 +195,14 @@ export interface AskPending extends IngestFailureDetail {
   /** Seconds to wait before polling again. */
   retry_after: number;
   /**
+   * WHICH ingest job this 202 is about, so a poller can name the job it is waiting for
+   * instead of reading whichever job the collection happens to display. See
+   * `CollectionJob.job_id` for the presence rules — an `ingest` 202 always carries one
+   * (against a service new enough to send it), an `ask` 202 only when that ask CREATED
+   * the job rather than joining one already running.
+   */
+  job_id?: string;
+  /**
    * Present only on `ingest`'s 202, which settles its charge before returning.
    * `ask`'s 202 computes usage later in the request and therefore sends none.
    */
@@ -263,6 +271,27 @@ export interface ExtendResult {
   creditsRemaining?: number;
 }
 
+/**
+ * One ingest job's progress, as `status()` reports it — the shape `CollectionStatus.job`
+ * has always had, extracted and named so `jobs[]` can reuse it field-for-field.
+ */
+export interface CollectionJob extends IngestFailureDetail {
+  pages_done: number;
+  pages_total: number;
+  state: "running" | "complete" | "failed";
+  /**
+   * WHICH job this block describes. Optional in three distinct ways, all of which a
+   * caller has to tolerate: an older deployment predates per-job rows and sends it
+   * nowhere; a row carried over from before those rows existed genuinely has no id; and
+   * only a call that CREATES a job is handed one back (see `AskPending.job_id`).
+   *
+   * Match it against the `job_id` from your own 202 rather than assuming `job` is yours:
+   * a collection can have several ingests in flight at once, and `job` is whichever one
+   * the service selects for display.
+   */
+  job_id?: string;
+}
+
 /** Returned by the identity-signed, free `status()` op. */
 export interface CollectionStatus {
   collection: string;
@@ -271,10 +300,18 @@ export interface CollectionStatus {
   chunks: number;
   created_at: string;
   expires_at: string;
-  job?: IngestFailureDetail & {
-    pages_done: number;
-    pages_total: number;
-    state: "running" | "complete" | "failed";
-  };
+  /**
+   * The collection-wide DISPLAY job: the most recent running job, else the most recent
+   * job of any state. Under concurrent ingests this is not necessarily the job any
+   * particular caller started — see `jobs`.
+   */
+  job?: CollectionJob;
+  /**
+   * EVERY retained job row, most recent first; `job` is the selected element of this
+   * list. Absent from an older deployment that keeps one job per collection, which is
+   * why a poller looking for a specific job must fall back to `job` rather than wait for
+   * an array that will never arrive.
+   */
+  jobs?: CollectionJob[];
   request_id?: string;
 }

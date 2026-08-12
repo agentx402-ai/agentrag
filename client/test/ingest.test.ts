@@ -501,7 +501,10 @@ describe("ingestAndWait", () => {
       fetchImpl: fetchImpl as unknown as typeof fetch,
     });
     await expect(
-      client.ingestAndWait({ sources: ["https://a.com"], maxWaitMs: Number.NaN }),
+      client.ingestAndWait({
+        sources: ["https://a.com"],
+        maxWaitMs: Number.NaN,
+      }),
     ).rejects.toMatchObject({ code: "invalid_request" });
     await expect(
       client.ingestAndWait({ sources: ["https://a.com"], maxWaitMs: 0 }),
@@ -695,5 +698,173 @@ describe("ingestAndWait", () => {
       }),
     ).rejects.toMatchObject({ code: "ingest_timeout" });
     expect(ingestCalls).toBe(1); // one paid ingest call, never repeated on timeout
+  }, 2_000);
+});
+
+// A collection holds one job per distinct ingest spec, so two ingests can be in flight
+// against it at once. `status()`'s `job` is the collection-wide DISPLAY job — under
+// concurrency, not necessarily the caller's — while `jobs[]` carries every one of them,
+// each named by the `job_id` its own 202 handed back.
+describe("ingestAndWait: pins the job its own 202 named", () => {
+  /** A sibling ingest that finished first, with counters nothing like the caller's. */
+  const sibling = {
+    job_id: "job_sibling",
+    pages_done: 7,
+    pages_total: 7,
+    state: "complete",
+    pages_ok: 7,
+    pages_failed: 0,
+    refunded_credits: 77,
+  };
+
+  it("does not end the wait — or report a verdict — on a concurrent sibling's job", async () => {
+    let ingestPosts = 0;
+    let statusReads = 0;
+    const fetchImpl = (async (_input: unknown, init?: RequestInit) => {
+      if ((init?.method ?? "GET") === "POST") {
+        ingestPosts++;
+        return new Response(
+          JSON.stringify(
+            ingestEnvelope(
+              {
+                collection: "c10",
+                status: "ingesting",
+                job_id: "job_mine",
+                pages_done: 0,
+                pages_total: 5,
+                retry_after: 0,
+              },
+              { request_id: "r-ingest" },
+            ),
+          ),
+          { status: 202 },
+        );
+      }
+      statusReads++;
+      // The caller's own job goes terminal on the SECOND read; the sibling is already
+      // complete on the first, and is what `job` reports throughout.
+      const mine =
+        statusReads >= 2
+          ? {
+              job_id: "job_mine",
+              pages_done: 5,
+              pages_total: 5,
+              state: "failed",
+              pages_ok: 3,
+              pages_failed: 2,
+              failures: [{ url: "https://a.com/p4", reason: "thin_content" }],
+              refunded_credits: 10,
+            }
+          : {
+              job_id: "job_mine",
+              pages_done: 1,
+              pages_total: 5,
+              state: "running",
+            };
+      return new Response(
+        JSON.stringify(
+          statusEnvelope({
+            collection: "c10",
+            model: "@cf/baai/bge-m3",
+            pages: 12,
+            chunks: 30,
+            created_at: "2026-08-01T00:00:00.000Z",
+            expires_at: "2026-09-05T00:00:00.000Z",
+            job: sibling,
+            jobs: [sibling, mine],
+          }),
+        ),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+    const client = new AgentRag({ accountKey: AK, endpoint, fetchImpl });
+
+    const result = await client.ingestAndWait({
+      sources: ["https://a.com/**"],
+      pollIntervalMs: 0,
+      maxWaitMs: 5_000,
+    });
+
+    // Two polls (running, then terminal) plus the one terminal status() read. Reading the
+    // display job instead would have stopped after ONE poll, on the sibling's "complete".
+    expect(statusReads).toBe(3);
+    expect(ingestPosts).toBe(1);
+
+    // Every outcome field is the caller's own job's, not the sibling's — the assembly read
+    // has to be pinned too, not just the poll.
+    expect(result).toMatchObject({
+      collection: "c10",
+      status: "failed",
+      pages_total: 5,
+      pages_ok: 3,
+      pages_failed: 2,
+      refunded_credits: 10,
+      chunks: 30, // collection-wide, and genuinely so: no per-job answer exists
+    });
+    expect(result.failures?.[0]).toMatchObject({ reason: "thin_content" });
+  });
+
+  it("falls back to the display job when the service sends no jobs[] — never waits for an array that will not arrive", async () => {
+    let statusReads = 0;
+    const fetchImpl = (async (_input: unknown, init?: RequestInit) => {
+      if ((init?.method ?? "GET") === "POST") {
+        return new Response(
+          JSON.stringify(
+            ingestEnvelope({
+              collection: "c11",
+              status: "ingesting",
+              // The 202 names the job, but the status route below is an older deployment
+              // that still reports one job per collection. Waiting for `jobs[]` to appear
+              // would hang until maxWaitMs on a job that is finishing normally.
+              job_id: "job_mine",
+              pages_done: 0,
+              pages_total: 2,
+              retry_after: 0,
+            }),
+          ),
+          { status: 202 },
+        );
+      }
+      statusReads++;
+      return new Response(
+        JSON.stringify(
+          statusEnvelope({
+            collection: "c11",
+            model: "@cf/baai/bge-m3",
+            pages: 2,
+            chunks: 8,
+            created_at: "2026-08-01T00:00:00.000Z",
+            expires_at: "2026-09-01T00:00:00.000Z",
+            job:
+              statusReads >= 2
+                ? {
+                    pages_done: 2,
+                    pages_total: 2,
+                    state: "complete",
+                    pages_ok: 2,
+                    pages_failed: 0,
+                  }
+                : { pages_done: 1, pages_total: 2, state: "running" },
+          }),
+        ),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+    const client = new AgentRag({ accountKey: AK, endpoint, fetchImpl });
+
+    const result = await client.ingestAndWait({
+      sources: ["https://a.com/**"],
+      pollIntervalMs: 0,
+      maxWaitMs: 5_000,
+    });
+
+    expect(statusReads).toBe(3); // running -> complete -> the terminal assembly read
+    expect(result).toMatchObject({
+      collection: "c11",
+      status: "complete",
+      pages_ok: 2,
+      pages_failed: 0,
+      chunks: 8,
+    });
   }, 2_000);
 });
