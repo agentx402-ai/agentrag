@@ -914,8 +914,8 @@ describe("pollIngestJobState (askAndWait's internal poll helper)", () => {
   // Thin protected-access subclass, mirroring this repo's existing pattern
   // (spend-caps.test.ts / account-mode.test.ts) for driving a protected method directly.
   class PollTestClient extends AgentRag {
-    poll(collection: string) {
-      return this.pollIngestJobState(collection);
+    poll(collection: string, jobId?: string) {
+      return this.pollIngestJobState(collection, jobId);
     }
   }
 
@@ -999,5 +999,155 @@ describe("pollIngestJobState (askAndWait's internal poll helper)", () => {
 
     expect(await client.poll("c1")).toBe("complete");
     expect(attempt).toBe(2);
+  });
+
+  it("reads the NAMED job out of jobs[], not the display job", async () => {
+    const fetchImpl = (async () =>
+      new Response(
+        JSON.stringify(
+          statusEnvelope({
+            collection: "c1",
+            job: {
+              job_id: "job_sibling",
+              pages_done: 7,
+              pages_total: 7,
+              state: "complete",
+            },
+            jobs: [
+              {
+                job_id: "job_sibling",
+                pages_done: 7,
+                pages_total: 7,
+                state: "complete",
+              },
+              {
+                job_id: "job_mine",
+                pages_done: 1,
+                pages_total: 4,
+                state: "running",
+              },
+            ],
+          }),
+        ),
+        { status: 200 },
+      )) as unknown as typeof fetch;
+    const client = new PollTestClient({ accountKey: AK, endpoint, fetchImpl });
+
+    expect(await client.poll("c1", "job_mine")).toBe("running");
+    expect(await client.poll("c1", "job_sibling")).toBe("complete");
+    // No id: the display job, exactly as before jobs carried ids.
+    expect(await client.poll("c1")).toBe("complete");
+    // A named job absent from a jobs[] that IS present reads as terminal, never "running":
+    // the service never evicts a running row, so an id missing from that list is a job that
+    // finished and aged out (or whose row was never written) — and calling it "running"
+    // would hang the wait on a job nobody will report progress for again.
+    expect(await client.poll("c1", "job_vanished")).toBeUndefined();
+  });
+
+  it("falls back to the display job when the service sends no jobs[] at all", async () => {
+    const fetchImpl = (async () =>
+      new Response(
+        JSON.stringify(
+          statusEnvelope({
+            collection: "c1",
+            job: { pages_done: 1, pages_total: 4, state: "running" },
+          }),
+        ),
+        { status: 200 },
+      )) as unknown as typeof fetch;
+    const client = new PollTestClient({ accountKey: AK, endpoint, fetchImpl });
+
+    // An older deployment names no jobs; a newer client must keep reading the one job it
+    // does report rather than wait on an array that is never going to arrive.
+    expect(await client.poll("c1", "job_mine")).toBe("running");
+  });
+});
+
+describe("askAndWait: pins the job its own 202 named", () => {
+  it("keeps waiting when a concurrent sibling completes first, and re-asks only once its OWN job is done", async () => {
+    let askPosts = 0;
+    let statusReads = 0;
+    const sibling = {
+      job_id: "job_sibling",
+      pages_done: 7,
+      pages_total: 7,
+      state: "complete",
+    };
+    const fetchImpl = (async (_input: unknown, init?: RequestInit) => {
+      if ((init?.method ?? "GET") === "POST") {
+        askPosts++;
+        if (askPosts === 1) {
+          return new Response(
+            JSON.stringify(
+              askEnvelope({
+                collection: "c12",
+                status: "ingesting",
+                job_id: "job_mine",
+                pages_done: 0,
+                pages_total: 3,
+                retry_after: 0,
+              }),
+            ),
+            { status: 202 },
+          );
+        }
+        // The re-ask, issued only once THIS call's own ingest is done.
+        return new Response(
+          JSON.stringify(
+            askEnvelope({
+              collection: "c12",
+              expires_at: "2026-09-01T00:00:00.000Z",
+              matched: true,
+              chunks: [
+                {
+                  text: "final",
+                  score: 0.9,
+                  url: null,
+                  title: null,
+                  position: 0,
+                },
+              ],
+            }),
+          ),
+          { status: 200 },
+        );
+      }
+      statusReads++;
+      const mine = {
+        job_id: "job_mine",
+        pages_done: statusReads >= 2 ? 3 : 1,
+        pages_total: 3,
+        state: statusReads >= 2 ? "complete" : "running",
+      };
+      return new Response(
+        JSON.stringify(
+          statusEnvelope({
+            collection: "c12",
+            model: "@cf/baai/bge-m3",
+            pages: 10,
+            chunks: 20,
+            created_at: "2026-08-01T00:00:00.000Z",
+            expires_at: "2026-09-01T00:00:00.000Z",
+            // The sibling is what the collection DISPLAYS, and it is already complete.
+            job: sibling,
+            jobs: [sibling, mine],
+          }),
+        ),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+    const client = new AgentRag({ accountKey: AK, endpoint, fetchImpl });
+
+    const result = await client.askAndWait("what is x", {
+      sources: ["https://a.com"],
+      pollIntervalMs: 0,
+      maxWaitMs: 5_000,
+    });
+
+    expect(result.chunks).toHaveLength(1);
+    // Reading the display job would have re-asked after the FIRST poll, answering from a
+    // collection this call's own ingest had not finished filling.
+    expect(statusReads).toBe(2);
+    expect(askPosts).toBe(2);
   });
 });

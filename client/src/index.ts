@@ -30,6 +30,7 @@ import type {
   AskOptions,
   AskPending,
   AskResult,
+  CollectionJob,
   CollectionStatus,
   ExtendResult,
   IngestDocument,
@@ -302,6 +303,38 @@ type DataOf<T> = T extends unknown
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Pick the job a wait is actually about out of a `status()` read.
+ *
+ * `status.job` is the collection-wide DISPLAY job, and a collection can run several
+ * ingests at once (one job per distinct spec), so reading `job` to decide whether "the"
+ * ingest is done can substitute a SIBLING's job for the caller's: a verdict about the
+ * wrong work, or — if the sibling outlives the caller's job — a wait that never ends on
+ * its own. `jobId` is the id the caller's own 202 handed back, and `status.jobs[]` is
+ * every retained job, so the two together name exactly one job.
+ *
+ * Both fallbacks below exist so a NEWER client keeps working against an OLDER service,
+ * which is the only configuration where either fires:
+ *
+ * - no `jobId` (the 202 carried none — an older service, or an `ask` that JOINED a job it
+ *   did not create) → the display job, i.e. exactly the pre-`job_id` behavior;
+ * - `jobId` but no `jobs[]` (a service that names jobs on the 202 but reports only one per
+ *   collection) → likewise the display job, rather than waiting on an array that is never
+ *   going to arrive.
+ *
+ * When `jobs[]` IS present and the id is not in it, the answer is `undefined` — treated by
+ * both callers as terminal, the same as a status with no job block at all. That is safe
+ * rather than merely convenient: the service never evicts a RUNNING job row from its
+ * retained set, so an id missing from a `jobs[]` that exists cannot be a job still in
+ * flight. It is one that finished and aged out, or one whose row was never written.
+ */
+function selectJob(status: CollectionStatus, jobId: string | undefined): CollectionJob | undefined {
+  if (jobId === undefined) return status.job;
+  const jobs = status.jobs;
+  if (!Array.isArray(jobs) || jobs.length === 0) return status.job;
+  return jobs.find((job) => job.job_id === jobId);
 }
 
 export class AgentRag {
@@ -793,6 +826,14 @@ export class AgentRag {
    * Polling here goes through a MINIMAL internal helper (`pollIngestJobState`) that reads
    * just the one field this method needs, delegating to the public `status()` below for
    * the actual request/parse (Task 6) rather than duplicating it.
+   *
+   * The poll is PINNED to the job the 202 named (`job_id`), never the collection's display
+   * job: a collection can run several ingests at once, and reading the display job lets a
+   * sibling's state end this wait — returning an answer against a collection this call's
+   * own ingest has not finished filling — or, if the sibling outlives it, keep the wait
+   * going past its own job's completion. Re-read per iteration, because a re-ask can hand
+   * back a fresh 202 naming a different job (or, when it JOINS a job it did not create,
+   * naming none — which falls back to today's display-job behavior; see `selectJob`).
    */
   async askAndWait(
     query: string,
@@ -829,7 +870,7 @@ export class AgentRag {
 
     let result = await this.ask(query, askOpts);
     while (isAskPending(result)) {
-      const { collection } = result;
+      const { collection, job_id: jobId } = result;
       const serverIntervalMs =
         Number.isFinite(result.retry_after) && result.retry_after > 0
           ? result.retry_after * 1000
@@ -847,7 +888,7 @@ export class AgentRag {
           );
         }
         await sleep(Math.min(interval, remaining));
-        const state = await this.pollIngestJobState(collection);
+        const state = await this.pollIngestJobState(collection, jobId);
         if (state !== "running") break;
       }
 
@@ -997,6 +1038,13 @@ export class AgentRag {
    * `job`'s own progress detail: `pages_ok`, `pages_failed`, `failures`, `stopped`,
    * `refunded_credits`) come from the terminal `status()` read.
    *
+   * BOTH of those reads resolve the job by the `job_id` the 202 named, never the
+   * collection's display job: several ingests can be in flight against one collection, so
+   * an unpinned poll can end on a sibling's state and an unpinned assembly can report a
+   * sibling's counters. `chunks`/`expires_at` stay collection-wide, because they are — no
+   * per-job answer to them exists. Against a service too old to name jobs, every read
+   * falls back to exactly the pre-`job_id` behavior (see `selectJob`).
+   *
    * Throws `ingest_timeout` at `maxWaitMs` (default `DEFAULT_ASK_WAIT_MS`, shared with
    * `askAndWait` — this wait has no reason to default differently). The job keeps running
    * server-side regardless — and, unlike a timed-out `askAndWait`, its charge has already
@@ -1033,7 +1081,9 @@ export class AgentRag {
     const result = await this.ingest(ingestOpts);
     if (!isAskPending(result)) return result;
 
-    const { collection } = result;
+    // The job THIS call started, named by the 202 (`undefined` against a service that
+    // does not name jobs). Every read below is pinned to it — see `selectJob`.
+    const { collection, job_id: jobId } = result;
     const serverIntervalMs =
       Number.isFinite(result.retry_after) && result.retry_after > 0
         ? result.retry_after * 1000
@@ -1052,29 +1102,36 @@ export class AgentRag {
         );
       }
       await sleep(Math.min(interval, remaining));
-      jobState = await this.pollIngestJobState(collection);
+      jobState = await this.pollIngestJobState(collection, jobId);
       if (jobState !== "running") break;
     }
 
     // The job is done — do NOT re-ingest (see doc comment above: that would double-charge
     // for work already paid for). One more status() read for the fields
     // pollIngestJobState doesn't expose, then assemble from both responses.
+    //
+    // This read is pinned to `jobId` for the same reason the poll is, and it matters just
+    // as much: every outcome field below comes from it, so resolving the collection's
+    // DISPLAY job here would report a sibling ingest's pages_ok/failures/refunded_credits
+    // as this call's own — a wrong answer about work the caller did not pay for, on the
+    // very fields it paid to learn.
     const finalStatus = await this.status(collection);
+    const finalJob = selectJob(finalStatus, jobId);
     return {
       collection: result.collection,
-      // finalStatus.job should always be present here — pollIngestJobState just observed
-      // a terminal state for this very collection — but the type allows a status read
-      // with no job block at all, so fall back to the state this loop itself just
+      // finalJob should always be present here — the poll just observed a terminal state
+      // for this very job — but a status read can legitimately name no such job (its row
+      // aged out, or was never written), so fall back to the state this loop itself just
       // observed, and only then to a pessimistic "failed" rather than fabricate success.
-      status: finalStatus.job?.state ?? jobState ?? "failed",
+      status: finalJob?.state ?? jobState ?? "failed",
       pages_total: result.pages_total,
       // Optional on IngestFailureDetail for the same old-deployment reason documented on
       // IngestResult itself; 0 only when the terminal job report omits it.
-      pages_failed: finalStatus.job?.pages_failed ?? 0,
-      pages_ok: finalStatus.job?.pages_ok,
-      failures: finalStatus.job?.failures,
-      stopped: finalStatus.job?.stopped,
-      refunded_credits: finalStatus.job?.refunded_credits,
+      pages_failed: finalJob?.pages_failed ?? 0,
+      pages_ok: finalJob?.pages_ok,
+      failures: finalJob?.failures,
+      stopped: finalJob?.stopped,
+      refunded_credits: finalJob?.refunded_credits,
       chunks: finalStatus.chunks,
       expires_at: finalStatus.expires_at,
       usage: result.usage,
@@ -1255,15 +1312,21 @@ export class AgentRag {
   }
 
   /**
-   * Minimal internal poll of a collection's ingest-job state, used ONLY by `askAndWait`.
-   * Delegates to the public `status()` above (Task 6) and reads just the one field this
-   * method needs — `undefined` when the response carries no `job` block (nothing ever ran
-   * there), which `askAndWait` treats the same as a terminal state (not "running").
+   * Minimal internal poll of ONE ingest job's state, shared by `askAndWait` and
+   * `ingestAndWait`. Delegates to the public `status()` above (Task 6) and reads just the
+   * one field its callers need — `undefined` when the read names no such job (nothing ever
+   * ran there, or the job is done and its row aged out), which both callers treat the same
+   * as a terminal state (not "running").
+   *
+   * `jobId` is the id the caller's own 202 handed back; without one this reads the
+   * collection's display job exactly as it always did. `selectJob` owns that choice and
+   * documents why each fallback is safe.
    */
   protected async pollIngestJobState(
     collection: string,
+    jobId?: string,
   ): Promise<"running" | "complete" | "failed" | undefined> {
     const result = await this.status(collection);
-    return result.job?.state;
+    return selectJob(result, jobId)?.state;
   }
 }
