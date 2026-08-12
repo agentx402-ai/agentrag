@@ -48,6 +48,10 @@ export type RagErrorCode =
   | "model_mismatch"
   | "invalid_source"
   | "ingest_failed"
+  // A collection may hold only so many ingest jobs in flight at once; an ingest that
+  // would exceed that is refused rather than queued. Retry after one of the live jobs
+  // reaches a terminal state (poll `status()`), or ingest into a different collection.
+  | "too_many_active_jobs"
   // client-side, pre-request / pre-signature
   | "invalid_config"
   | "request_failed"
