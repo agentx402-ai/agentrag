@@ -150,6 +150,25 @@ describe("extend: happy path (envelope-wrapped fixtures)", () => {
     expect(result.settledTxHash).toBe("");
   });
 
+  it("passes a caller-supplied idempotencyKey through so a retried extend dedups (no double-charge)", async () => {
+    // extend() had no idempotencyKey option, so a retry of a lost-but-settled extend used a
+    // fresh nonce and double-charged. The key must reach the Idempotency-Key header verbatim.
+    let sentKey: string | null = null;
+    const fetchImpl = (async (_u: unknown, init?: RequestInit) => {
+      sentKey = new Headers(init?.headers).get("Idempotency-Key");
+      return new Response(
+        JSON.stringify(
+          extendEnvelope({ collection: "c1", expires_at: "2026-10-01T00:00:00.000Z" }),
+        ),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+    const client = new AgentRag({ accountKey: AK, endpoint, fetchImpl });
+
+    await client.extend("c1", 30, { idempotencyKey: "my-extend-key" });
+    expect(sentKey).toBe("my-extend-key");
+  });
+
   it("account-key mode issues exactly ONE bearer request, never probes", async () => {
     const calls: RequestInit[] = [];
     const fetchImpl = (async (_u: unknown, init?: RequestInit) => {

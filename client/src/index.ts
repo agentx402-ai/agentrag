@@ -39,6 +39,7 @@ import type {
   RagModelId,
   Signer,
 } from "./types";
+import { totalPriceUsd } from "./usage";
 
 export { generateAccountKey, isAccountKeyFormat } from "./account";
 export {
@@ -151,6 +152,14 @@ export const MAX_DOCUMENT_BYTES = 100 * 1024;
 export const DEFAULT_ASK_WAIT_MS = 120_000;
 /** Fallback delay between polls, used only when both `pollIntervalMs` and the 202's `retry_after` are absent/non-positive. */
 export const DEFAULT_ASK_POLL_INTERVAL_MS = 15_000;
+/**
+ * Floor on the SERVER-supplied `retry_after` only. A 402/202 `retry_after` is untrusted
+ * input: a buggy or hostile service returning a sub-second (or 0.001s) value would otherwise
+ * drive a poll — and, in `askAndWait`, a re-ask — loop at network speed. An EXPLICIT
+ * `pollIntervalMs` (including the deliberately-valid `0`) is a caller decision and is never
+ * floored; this bounds only the pace a server can dictate on its own.
+ */
+export const MIN_SERVER_POLL_INTERVAL_MS = 1_000;
 
 const DEFAULT_NETWORK = "eip155:8453";
 // Mirrors the worker's own `mode` enum.
@@ -315,26 +324,39 @@ function sleep(ms: number): Promise<void> {
  * its own. `jobId` is the id the caller's own 202 handed back, and `status.jobs[]` is
  * every retained job, so the two together name exactly one job.
  *
- * Both fallbacks below exist so a NEWER client keeps working against an OLDER service,
- * which is the only configuration where either fires:
+ * The fallbacks below exist so a NEWER client keeps working against an OLDER service:
  *
- * - no `jobId` (the 202 carried none — an older service, or an `ask` that JOINED a job it
- *   did not create) → the display job, i.e. exactly the pre-`job_id` behavior;
- * - `jobId` but no `jobs[]` (a service that names jobs on the 202 but reports only one per
- *   collection) → likewise the display job, rather than waiting on an array that is never
- *   going to arrive.
+ * - no usable `jobId` — `undefined`, or a null/empty wire value that survived an
+ *   unvalidated JSON cast, or an `ask` that JOINED a job it did not create → the display
+ *   job, i.e. exactly the pre-`job_id` behavior. (`!jobId`, not `=== undefined`: a wire
+ *   `job_id: null`/`""` must take this branch, not fall through to a `find` that matches
+ *   nothing and then reads as terminal.)
+ * - `jobId` but NO `jobs[]` at all (a service that names jobs on the 202 but reports only
+ *   one per collection) → likewise the display job, rather than waiting on an array that is
+ *   never going to arrive. A present-but-EMPTY `jobs[]` is deliberately NOT this case: a new
+ *   service saying "no retained rows" must not silently adopt an unrelated display job (that
+ *   is the sibling substitution this whole function exists to prevent), so it flows through
+ *   the match below and yields `undefined`.
  *
- * When `jobs[]` IS present and the id is not in it, the answer is `undefined` — treated by
- * both callers as terminal, the same as a status with no job block at all. That is safe
- * rather than merely convenient: the service never evicts a RUNNING job row from its
- * retained set, so an id missing from a `jobs[]` that exists cannot be a job still in
- * flight. It is one that finished and aged out, or one whose row was never written.
+ * When `jobs[]` is present and the id is not in it, we last try the display job itself: if
+ * `status.job` IS this exact job, its retained row simply has not caught up yet, so use it —
+ * this is what keeps a caller's own freshly-created (and usually display) job from reading as
+ * terminal in the window before it appears in `jobs[]`. Only when the display job is a
+ * DIFFERENT job do we return `undefined` (treated as terminal): the service never evicts a
+ * RUNNING row, so an id missing from both `jobs[]` and the display slot has finished and aged
+ * out. (Residual, not closed here: a job whose first row was never written — a swallowed
+ * server-side watchdog failure — while an unrelated sibling holds the display slot still
+ * reads as terminal; fully closing that needs a service guarantee that a named job's row
+ * exists before its 202 names it.)
  */
 function selectJob(status: CollectionStatus, jobId: string | undefined): CollectionJob | undefined {
-  if (jobId === undefined) return status.job;
+  if (!jobId) return status.job;
   const jobs = status.jobs;
-  if (!Array.isArray(jobs) || jobs.length === 0) return status.job;
-  return jobs.find((job) => job.job_id === jobId);
+  if (!Array.isArray(jobs)) return status.job;
+  const match = jobs.find((job) => job.job_id === jobId);
+  if (match) return match;
+  if (status.job?.job_id === jobId) return status.job;
+  return undefined;
 }
 
 export class AgentRag {
@@ -397,7 +419,18 @@ export class AgentRag {
       maxSpendUsd: this.maxSpendUsd,
       maxSessionSpendUsd: this.maxSessionSpendUsd,
     });
-    this.maxRetries = Math.max(0, Math.floor(opts.maxRetries ?? 2));
+    // Validate before flooring: `Math.floor(NaN)` is `NaN` and `Math.floor(Infinity)` is
+    // `Infinity`, either of which would survive `Math.max(0, …)` and turn the retry loop
+    // unbounded. Fail closed at construction instead.
+    const rawMaxRetries = opts.maxRetries ?? 2;
+    if (!Number.isFinite(rawMaxRetries) || rawMaxRetries < 0) {
+      throw new AgentRagError(
+        `maxRetries must be a finite non-negative number (got ${rawMaxRetries})`,
+        "invalid_config",
+        0,
+      );
+    }
+    this.maxRetries = Math.floor(rawMaxRetries);
     this.timeoutMs = opts.timeoutMs;
     this.fetchImpl = opts.fetchImpl;
 
@@ -564,6 +597,12 @@ export class AgentRag {
     // not the challenge's, so a caller-configured maxSpendUsd/maxSessionSpendUsd still
     // binds a pinned amount exactly as it would an ordinary quoted one.
     pinnedAmountUsd?: number;
+    // Actual USD this op settled, read from the parsed success result's usage envelope —
+    // used by account-key (bearer) mode to move the cumulative session counter by what the
+    // server really charged. `undefined` (e.g. a result with no usage, like an ask 202)
+    // records nothing beyond the reservation's release. Wallet mode ignores this and
+    // records the signed amount instead.
+    settledUsdFrom?: (result: T) => number | undefined;
     buildRequest: (headers: Record<string, string>) => RequestInit;
     parseSuccess: (res: Response) => Promise<T>;
   }): Promise<T> {
@@ -571,14 +610,28 @@ export class AgentRag {
 
     // ---- Account-key (bearer) mode ----
     if (this.accountKey) {
-      const res = await this.fetchWithRetry(url, () =>
-        spec.buildRequest({
-          "Idempotency-Key": idempotencyKey,
-          ...buildBearerHeaders(this.accountKey!),
-        }),
-      );
-      if (!res.ok) throw await this.asError(res, label); // 402 insufficient_credits surfaces here
-      return spec.parseSuccess(res);
+      // Prepaid credits are REAL money, so the spend caps must bind this path exactly as
+      // they bind the wallet path (AGENTS.md invariant 1: caps bound EVERY paying path).
+      // There is no 402 quote to refuse pre-request — the settled price is only knowable
+      // from the response — so the per-call cap is asserted against the worst-case
+      // authorized ceiling (fails closed), reserved synchronously for concurrency, and the
+      // cumulative counter is moved by the amount the response actually settled.
+      const ceilingUsd = spec.pinnedAmountUsd ?? spec.authorizedCeilingUsd ?? DEFAULT_MAX_OP_USD;
+      const release = this.assertAndReserveSpend(ceilingUsd);
+      try {
+        const res = await this.fetchWithRetry(url, () =>
+          spec.buildRequest({
+            "Idempotency-Key": idempotencyKey,
+            ...buildBearerHeaders(this.accountKey!),
+          }),
+        );
+        if (!res.ok) throw await this.asError(res, label); // 402 insufficient_credits surfaces here
+        const result = await spec.parseSuccess(res);
+        this.recordSpend(spec.settledUsdFrom?.(result) ?? 0);
+        return result;
+      } finally {
+        release();
+      }
     }
 
     // ---- Wallet (x402) mode ----
@@ -733,6 +786,12 @@ export class AgentRag {
       }
       for (const source of opts.sources) assertValidSource(source);
     }
+    // Validate `collection` pre-request like every other collection-taking verb (ingest,
+    // extend, status, delete) — ask() was the only paying path that reached the network on
+    // an empty/malformed name, burning a wallet-mode signature on a body the worker 400s.
+    if (opts.collection !== undefined) {
+      assertValidCollectionName(opts.collection);
+    }
     if (opts.sources === undefined && opts.collection === undefined) {
       throw new AgentRagError(
         "at least one of sources or collection is required",
@@ -758,6 +817,7 @@ export class AgentRag {
       idempotencyKey: opts.idempotencyKey ?? freshNonce(),
       label: "ask failed",
       authorizedCeilingUsd: askAuthorizedCeilingUsd(opts.sources, effectiveMaxPages),
+      settledUsdFrom: (r) => totalPriceUsd((r as AskResult).usage),
       buildRequest: (headers) => ({
         method: "POST",
         headers: { "content-type": "application/json", ...headers },
@@ -862,18 +922,23 @@ export class AgentRag {
       );
     }
     const deadline = Date.now() + (maxWaitMs ?? DEFAULT_ASK_WAIT_MS);
-    // I2: computed once, outside the loop — askOpts.idempotencyKey doesn't change across
-    // iterations. `undefined` (not a derived string) when the caller supplied none, so
-    // the re-ask falls through to ask()'s own `?? freshNonce()` exactly as before.
-    const reAskIdempotencyKey =
-      askOpts.idempotencyKey !== undefined ? `${askOpts.idempotencyKey}:ask` : undefined;
+    // I2 + money-safety: computed ONCE and reused for every re-ask, so all re-asks in one
+    // askAndWait sign against a SINGLE EIP-3009 nonce (nonceFromIdempotencyKey is
+    // deterministic). Even if a pathological or hostile service keeps returning 202, at most
+    // ONE of the authorizations produced is settleable on-chain. This must hold on the
+    // DEFAULT (no caller key) path too: a prior version left this `undefined` there, so
+    // ask() fell through to `freshNonce()` per iteration and minted a fresh, separately
+    // settleable nonce every loop — an unbounded number of valid payment authorizations from
+    // a single call (`maxSpendUsd` bounds one honest leg, so it never fired). Seeding a
+    // stable base here (the caller's key, else one freshNonce for the whole call) closes it.
+    const reAskIdempotencyKey = `${askOpts.idempotencyKey ?? freshNonce()}:ask`;
 
     let result = await this.ask(query, askOpts);
     while (isAskPending(result)) {
       const { collection, job_id: jobId } = result;
       const serverIntervalMs =
         Number.isFinite(result.retry_after) && result.retry_after > 0
-          ? result.retry_after * 1000
+          ? Math.max(result.retry_after * 1000, MIN_SERVER_POLL_INTERVAL_MS)
           : DEFAULT_ASK_POLL_INTERVAL_MS;
       const interval = Math.max(0, pollIntervalMs ?? serverIntervalMs);
 
@@ -987,6 +1052,7 @@ export class AgentRag {
         opts.documents?.length ?? 0,
         effectiveMaxPages,
       ),
+      settledUsdFrom: (r) => totalPriceUsd((r as IngestResult).usage),
       buildRequest: (headers) => ({
         method: "POST",
         headers: { "content-type": "application/json", ...headers },
@@ -1086,7 +1152,7 @@ export class AgentRag {
     const { collection, job_id: jobId } = result;
     const serverIntervalMs =
       Number.isFinite(result.retry_after) && result.retry_after > 0
-        ? result.retry_after * 1000
+        ? Math.max(result.retry_after * 1000, MIN_SERVER_POLL_INTERVAL_MS)
         : DEFAULT_ASK_POLL_INTERVAL_MS;
     const interval = Math.max(0, pollIntervalMs ?? serverIntervalMs);
 
@@ -1187,7 +1253,12 @@ export class AgentRag {
    * price directly), so it skips the `status()` pre-check entirely — there is nothing for a
    * pinned amount to protect there, and the extra round-trip would be pure overhead.
    */
-  async extend(collection: string, days: 30 | 60 | 90): Promise<ExtendResult> {
+  async extend(
+    collection: string,
+    days: 30 | 60 | 90,
+    opts: { idempotencyKey?: string } = {},
+  ): Promise<ExtendResult> {
+    const { idempotencyKey } = opts;
     assertValidCollectionName(collection);
     if (days !== 30 && days !== 60 && days !== 90) {
       throw new AgentRagError(`days must be one of 30, 60, 90 (got ${days})`, "invalid_request", 0);
@@ -1215,10 +1286,11 @@ export class AgentRag {
       method: "POST",
       path: "/v1/rag/extend",
       url: `${this.endpoint}/v1/rag/extend`,
-      idempotencyKey: freshNonce(),
+      idempotencyKey: idempotencyKey ?? freshNonce(),
       label: "extend failed",
       authorizedCeilingUsd: structuralCeilingUsd,
       pinnedAmountUsd: this.accountKey ? undefined : realAmountUsd,
+      settledUsdFrom: (r) => totalPriceUsd((r as ExtendResult).usage),
       buildRequest: (headers) => ({
         method: "POST",
         headers: { "content-type": "application/json", ...headers },

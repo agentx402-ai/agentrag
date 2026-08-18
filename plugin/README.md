@@ -9,11 +9,10 @@ free `rag_wallet_address` (find the address to fund). Every paid call settles in
 — wallet-native by default, with an opt-in account-key (`ak_` bearer) mode for managed wallets.
 Collection content is **not** encrypted (it is stored and indexed in the clear server-side).
 
-> **Prerequisite:** the plugin runs `npx -y @agentrag/cli mcp`, so [`@agentrag/cli`](../cli)
-> must be resolvable via `npx`. **As of this writing, `@agentrag/cli` has not yet been published
-> to npm** (that happens at the project's first release) — until then `npx` cannot resolve it and
-> the server fails to start, so use the local-checkout method below instead. Once published,
-> `npx` fetches it automatically on first use and no local checkout is required.
+> **Prerequisite:** the plugin runs `npx -y @agentrag/cli@<version> mcp`, so
+> [`@agentrag/cli`](../cli) must be resolvable via `npx`. It **is published to npm**, so `npx`
+> fetches the pinned version automatically on first use and no local checkout is required (the
+> local-checkout method below is for development only).
 >
 > **Windows:** `.mcp.json` uses `"command": "npx"`. Claude Code's MCP launcher resolves the
 > `npx.cmd` shim on Windows automatically, so this works as-is. Other MCP clients that spawn the
@@ -23,10 +22,8 @@ Collection content is **not** encrypted (it is stored and indexed in the clear s
 
 ## Install
 
-> **Pre-release note:** as of this writing, `@agentrag/cli` has not yet been published to npm
-> and this plugin has not yet been registered in the shared marketplace, so the marketplace
-> steps below don't work yet end-to-end. Use the **local checkout** method instead until both
-> are live.
+`@agentrag/cli` is published to npm; if this plugin is not yet registered in the shared
+marketplace, use the **local checkout** method below until it is.
 
 **1. Add the marketplace and install the plugin** — run these in Claude Code:
 
@@ -43,11 +40,10 @@ git clone https://github.com/agentx402-ai/agentrag
 cd agentrag && npm ci && npm run build
 ```
 
-`--plugin-dir` still loads `plugin/agentrag/.mcp.json` as checked in, and that file still runs
-`npx -y @agentrag/cli@0.1.0 mcp` — a version-pinned registry spec that fails until
-`@agentrag/cli` is published (see the pre-release note above), regardless of the local build you
-just made. Until then, point your **local, uncommitted** copy of `.mcp.json` at that build
-instead — edit `command`/`args` only, leave `env` as-is:
+`--plugin-dir` loads `plugin/agentrag/.mcp.json` as checked in, and that file runs
+`npx -y @agentrag/cli@0.1.6 mcp` — a version-pinned registry spec that fetches the published
+package rather than the local build you just made. To test a LOCAL build instead, point your
+**local, uncommitted** copy of `.mcp.json` at it — edit `command`/`args` only, leave `env` as-is:
 
 ```json
 {

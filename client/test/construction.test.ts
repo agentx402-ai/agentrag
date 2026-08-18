@@ -82,6 +82,16 @@ describe("AgentRag construction", () => {
     expect(new AgentRag({ signer, endpoint, maxRetries: 5 }).maxRetries).toBe(5);
   });
 
+  it("rejects a non-finite or negative maxRetries (Infinity/NaN would make the retry loop unbounded)", () => {
+    // Math.floor(NaN) is NaN and Math.floor(Infinity) is Infinity — both survive Math.max(0, …)
+    // and turn fetchWithRetry into an unbounded loop. Fail closed at construction instead.
+    expect(() => new AgentRag({ signer, endpoint, maxRetries: Number.POSITIVE_INFINITY })).toThrow(
+      /maxRetries/,
+    );
+    expect(() => new AgentRag({ signer, endpoint, maxRetries: Number.NaN })).toThrow(/maxRetries/);
+    expect(() => new AgentRag({ signer, endpoint, maxRetries: -1 })).toThrow(/maxRetries/);
+  });
+
   it("rejects an endpoint that is not an absolute http(s) URL", () => {
     // The endpoint decides WHO issues the 402 a wallet then signs against, so a malformed
     // or non-http(s) value must fail at construction (invalid_config) — not as a bare

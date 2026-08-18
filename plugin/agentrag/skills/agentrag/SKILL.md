@@ -98,12 +98,17 @@ credits**, at 80% of the wallet-mode price. Two things are specific to AgentRAG:
   same account ledger:
 
   ```bash
-  # Fund the ak_ account from ANY signing wallet (via AgentKV's deposit route):
+  # Fund the ak_ account from ANY signing wallet (via AgentKV's deposit route).
+  # Keep the bearer in an env var — do NOT paste the raw ak_ token as a literal argument:
+  # anything on the command line is visible in `ps` and your shell history.
+  export AGENTRAG_ACCOUNT_KEY=ak_...   # set once, in a private shell
   awal x402 pay https://api.agentx402.ai/v1/account/deposit \
-    --headers '{"Authorization":"Bearer ak_..."}'
+    --headers "{\"Authorization\":\"Bearer ${AGENTRAG_ACCOUNT_KEY}\"}"
   ```
 
-  The credits that deposit buys are then spendable by AgentRAG under the same `ak_` bearer.
+  (The shell still expands the token into this one process's argv, so run it in a trusted,
+  non-logged session — treat it like any other secret-bearing command.) The credits that
+  deposit buys are then spendable by AgentRAG under the same `ak_` bearer.
 
 - **`rag_extend`'s pricing read is skipped in account-key mode.** In wallet mode, `extend`
   reads the collection's real chunk count via a free status call before signing the real

@@ -118,6 +118,20 @@ export function readConfigFile(env: NodeJS.ProcessEnv): Partial<ResolvedConfig> 
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new AgentRagError(`config file ${file} must contain a JSON object`, "invalid_config", 0);
   }
+  // Secrets are read from the ENVIRONMENT only — resolveConfig never sources privateKey/
+  // accountKey from this file. A secret field here is therefore doubly wrong: silently inert
+  // (the user thinks they configured auth and did not), and a real key sitting in a plaintext
+  // config file. Fail closed and tell the operator to move it to env, rather than ignore it.
+  for (const secretField of ["privateKey", "accountKey"] as const) {
+    if (secretField in (parsed as Record<string, unknown>)) {
+      throw new AgentRagError(
+        `config file ${file} must not contain "${secretField}" — secrets are read from the ` +
+          "environment only (AGENTRAG_PRIVATE_KEY / AGENTRAG_ACCOUNT_KEY); remove it from the file",
+        "invalid_config",
+        0,
+      );
+    }
+  }
   return parsed as Partial<ResolvedConfig>;
 }
 

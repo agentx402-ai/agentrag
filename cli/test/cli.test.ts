@@ -43,6 +43,21 @@ describe("runCli dispatch", () => {
     expect(JSON.parse(err.join("")).code).toBe("usage");
   });
 
+  it("`mcp` with trailing flags -> EXIT.USAGE (never silently drops a money flag or starts the server)", async () => {
+    // `agentrag mcp --max-spend-usd 5` used to silently ignore the flag and start the server
+    // with the cap unset. It must fail closed with a usage error instead.
+    const err: string[] = [];
+    const code = await runCli(["mcp", "--max-spend-usd", "5"], {
+      stdout: sink,
+      stderr: (s) => err.push(s),
+      env: {},
+    });
+    expect(code).toBe(EXIT.USAGE);
+    const parsed = JSON.parse(err.join(""));
+    expect(parsed.code).toBe("usage");
+    expect(parsed.error).toMatch(/mcp takes no arguments/);
+  });
+
   it("--version prints VERSION and exits OK", async () => {
     const out: string[] = [];
     const code = await runCli(["--version"], {

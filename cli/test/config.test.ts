@@ -198,6 +198,30 @@ describe("readConfigFile — absent vs unusable", () => {
     }
   });
 
+  it("a config.json carrying a secret field fails closed (never silently ignored)", () => {
+    // Secrets are read from env ONLY. A privateKey/accountKey in config.json is both inert
+    // (the user thinks auth is configured and it is not) AND a real key in a plaintext file.
+    for (const field of ["privateKey", "accountKey"]) {
+      const env = tmpEnv();
+      try {
+        writeFileSync(
+          configPath(env),
+          JSON.stringify({ endpoint: "https://x.example", [field]: "s3cret" }),
+        );
+        expect(() => readConfigFile(env)).toThrow(new RegExp(`must not contain "${field}"`));
+        let code: string | undefined;
+        try {
+          readConfigFile(env);
+        } catch (e) {
+          code = (e as AgentRagError).code;
+        }
+        expect(code).toBe("invalid_config");
+      } finally {
+        clean(env);
+      }
+    }
+  });
+
   it.skipIf(process.platform === "win32")(
     "a config.json that exists but can't be read throws (not mistaken for absent)",
     () => {

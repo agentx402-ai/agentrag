@@ -868,3 +868,241 @@ describe("ingestAndWait: pins the job its own 202 named", () => {
     });
   }, 2_000);
 });
+
+// H3: selectJob must not turn a job whose retained row has not caught up into a fabricated
+// terminal "failed" verdict for an ingest that is running and already paid for. Verified
+// against the built client: the pre-fix code returned { status: "failed", pages_failed: 0 }
+// in 53ms for a running job, which prompts the caller to re-ingest and double-pay.
+describe("selectJob pinning hardening (H3)", () => {
+  it("keeps waiting when the caller's running job is the display job but not yet in jobs[]", async () => {
+    let step = 0;
+    const posts: string[] = [];
+    const fetchImpl = (async (_input: unknown, init?: RequestInit) => {
+      const method = init?.method ?? "GET";
+      step++;
+      if (method === "POST") {
+        posts.push("ingest");
+        return new Response(
+          JSON.stringify(
+            ingestEnvelope(
+              {
+                collection: "c1",
+                status: "ingesting",
+                job_id: "job_mine",
+                pages_done: 0,
+                pages_total: 5,
+                retry_after: 0,
+              },
+              { request_id: "r-ingest" },
+            ),
+          ),
+          { status: 202 },
+        );
+      }
+      if (step === 2) {
+        // The caller's own row has not materialized in jobs[] yet; the display job IS the
+        // caller's job, and it is RUNNING. Pre-fix: selectJob returned undefined -> terminal.
+        return new Response(
+          JSON.stringify(
+            statusEnvelope({
+              collection: "c1",
+              model: "@cf/baai/bge-m3",
+              pages: 0,
+              chunks: 0,
+              created_at: "2026-08-01T00:00:00.000Z",
+              expires_at: "2026-09-01T00:00:00.000Z",
+              job: { job_id: "job_mine", pages_done: 0, pages_total: 5, state: "running" },
+              jobs: [{ job_id: "job_old", pages_done: 3, pages_total: 3, state: "complete" }],
+            }),
+          ),
+          { status: 200 },
+        );
+      }
+      // The job has now completed and appears in jobs[].
+      return new Response(
+        JSON.stringify(
+          statusEnvelope({
+            collection: "c1",
+            model: "@cf/baai/bge-m3",
+            pages: 5,
+            chunks: 12,
+            created_at: "2026-08-01T00:00:00.000Z",
+            expires_at: "2026-09-05T00:00:00.000Z",
+            job: {
+              job_id: "job_mine",
+              pages_done: 5,
+              pages_total: 5,
+              state: "complete",
+              pages_ok: 5,
+              pages_failed: 0,
+            },
+            jobs: [
+              {
+                job_id: "job_mine",
+                pages_done: 5,
+                pages_total: 5,
+                state: "complete",
+                pages_ok: 5,
+                pages_failed: 0,
+              },
+              { job_id: "job_old", pages_done: 3, pages_total: 3, state: "complete" },
+            ],
+          }),
+        ),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+    const client = new AgentRag({ accountKey: AK, endpoint, fetchImpl });
+
+    const result = await client.ingestAndWait({
+      sources: ["https://a.com/**"],
+      pollIntervalMs: 0,
+      maxWaitMs: 5_000,
+    });
+
+    // NOT the fabricated { status: "failed", pages_failed: 0, pages_ok: undefined }.
+    expect(result).toMatchObject({
+      collection: "c1",
+      status: "complete",
+      pages_ok: 5,
+      pages_failed: 0,
+    });
+    expect(posts).toHaveLength(1); // never re-ingested -> no double charge
+  });
+
+  it("does NOT surface a sibling's counters when jobs[] is present-but-empty", async () => {
+    // Regression for the dropped `|| jobs.length === 0` branch: an empty jobs[] alongside a
+    // display job that is an unrelated completed SIBLING must resolve to undefined (terminal
+    // for THIS caller), never report the sibling's pages_ok/refunded_credits as the caller's.
+    const fetchImpl = (async (_input: unknown, init?: RequestInit) => {
+      const method = init?.method ?? "GET";
+      if (method === "POST") {
+        return new Response(
+          JSON.stringify(
+            ingestEnvelope(
+              {
+                collection: "c1",
+                status: "ingesting",
+                job_id: "job_mine",
+                pages_done: 0,
+                pages_total: 5,
+                retry_after: 0,
+              },
+              { request_id: "r-ingest" },
+            ),
+          ),
+          { status: 202 },
+        );
+      }
+      return new Response(
+        JSON.stringify(
+          statusEnvelope({
+            collection: "c1",
+            model: "@cf/baai/bge-m3",
+            pages: 9,
+            chunks: 40,
+            created_at: "2026-08-01T00:00:00.000Z",
+            expires_at: "2026-09-01T00:00:00.000Z",
+            job: {
+              job_id: "job_sibling",
+              pages_done: 7,
+              pages_total: 7,
+              state: "complete",
+              pages_ok: 7,
+              refunded_credits: 77,
+            },
+            jobs: [],
+          }),
+        ),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+    const client = new AgentRag({ accountKey: AK, endpoint, fetchImpl });
+
+    const result = await client.ingestAndWait({
+      sources: ["https://a.com/**"],
+      pollIntervalMs: 0,
+      maxWaitMs: 5_000,
+    });
+
+    // The sibling's success must NEVER be attributed to this caller.
+    expect(result.pages_ok).toBeUndefined();
+    expect(result.refunded_credits).toBeUndefined();
+    expect(result.status).not.toBe("complete");
+  });
+
+  it("falls back to the display job on a null/empty wire job_id instead of matching nothing", async () => {
+    // Regression for `!jobId` (was `jobId === undefined`): a wire job_id: null survives the
+    // unvalidated JSON cast; it must take the display-job fallback, not a find() that misses
+    // and reads as terminal.
+    let step = 0;
+    const fetchImpl = (async (_input: unknown, init?: RequestInit) => {
+      const method = init?.method ?? "GET";
+      step++;
+      if (method === "POST") {
+        return new Response(
+          JSON.stringify(
+            ingestEnvelope(
+              {
+                collection: "c1",
+                status: "ingesting",
+                job_id: null, // malformed wire value
+                pages_done: 0,
+                pages_total: 5,
+                retry_after: 0,
+              },
+              { request_id: "r-ingest" },
+            ),
+          ),
+          { status: 202 },
+        );
+      }
+      if (step === 2) {
+        return new Response(
+          JSON.stringify(
+            statusEnvelope({
+              collection: "c1",
+              model: "@cf/baai/bge-m3",
+              pages: 0,
+              chunks: 0,
+              created_at: "2026-08-01T00:00:00.000Z",
+              expires_at: "2026-09-01T00:00:00.000Z",
+              // A non-empty jobs[] is present (a prior job's retained row) AND the display
+              // job carries no id — so the pre-fix `jobId === undefined` check (false for
+              // null) would run jobs.find(null), miss, and read as terminal. `!jobId` must
+              // take the display-job fallback instead.
+              job: { pages_done: 0, pages_total: 5, state: "running" },
+              jobs: [{ job_id: "job_old", pages_done: 3, pages_total: 3, state: "complete" }],
+            }),
+          ),
+          { status: 200 },
+        );
+      }
+      return new Response(
+        JSON.stringify(
+          statusEnvelope({
+            collection: "c1",
+            model: "@cf/baai/bge-m3",
+            pages: 5,
+            chunks: 12,
+            created_at: "2026-08-01T00:00:00.000Z",
+            expires_at: "2026-09-05T00:00:00.000Z",
+            job: { pages_done: 5, pages_total: 5, state: "complete", pages_ok: 5, pages_failed: 0 },
+            jobs: [{ job_id: "job_old", pages_done: 3, pages_total: 3, state: "complete" }],
+          }),
+        ),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+    const client = new AgentRag({ accountKey: AK, endpoint, fetchImpl });
+
+    const result = await client.ingestAndWait({
+      sources: ["https://a.com/**"],
+      pollIntervalMs: 0,
+      maxWaitMs: 5_000,
+    });
+
+    // Display-job fallback observed "running" then "complete" — not a first-poll terminal.
+    expect(result).toMatchObject({ collection: "c1", status: "complete", pages_ok: 5 });
+  });
+});

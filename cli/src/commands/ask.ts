@@ -1,5 +1,5 @@
 import type { AskOptions } from "@agentrag/client";
-import { ASK_FLAGS, parseFlags } from "../args";
+import { ASK_FLAGS, extraPositionalError, parseFlags } from "../args";
 import { EXIT, printError, printJson, type Writer } from "../output";
 
 // Exported so tests can type a fake client against the exact shape the real AgentRag must
@@ -26,6 +26,8 @@ export function parseAskArgs(args: string[]): AskArgs {
   const { flags, positionals } = parseFlags(args, ASK_FLAGS);
   const query = positionals[0];
   if (!query) return { ok: false, message: "ask requires <query>" };
+  const extra = extraPositionalError(positionals, "ask", "query");
+  if (extra) return { ok: false, message: extra };
   const f = flags as {
     sources?: string[];
     collection?: string;

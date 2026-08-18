@@ -139,12 +139,19 @@ export interface IngestFailureDetail {
 }
 
 /** Ingest progress snapshot — surfaced inline on `AskResult.ingest` (a background top-up
- * observed alongside an answer), and mirrored field-for-field by `CollectionStatus.job`
- * and `AskPending`. */
+ * observed alongside an answer). Shares the `IngestFailureDetail` base and the optional
+ * `job_id` with `CollectionStatus.job` (`CollectionJob`) and `AskPending`, so all three
+ * progress surfaces can be pinned to a specific job; the progress fields themselves differ by
+ * surface (here `status` is a free string and the page counts are optional, whereas
+ * `CollectionJob` narrows `state` to a union and requires the counts). */
 export interface IngestProgress extends IngestFailureDetail {
   status: string;
   pages_done?: number;
   pages_total?: number;
+  /** WHICH job this inline progress block describes — matches the `job_id` a caller's own
+   * 202 named, so a background top-up observed on `AskResult.ingest` can be pinned to a
+   * follow-up `status()` poll. Absent against a service too old to name jobs. */
+  job_id?: string;
 }
 
 export interface AskOptions {
@@ -196,10 +203,17 @@ export interface AskPending extends IngestFailureDetail {
   retry_after: number;
   /**
    * WHICH ingest job this 202 is about, so a poller can name the job it is waiting for
-   * instead of reading whichever job the collection happens to display. See
-   * `CollectionJob.job_id` for the presence rules — an `ingest` 202 always carries one
-   * (against a service new enough to send it), an `ask` 202 only when that ask CREATED
-   * the job rather than joining one already running.
+   * instead of reading whichever job the collection happens to display. Match it against your
+   * own `status().jobs[]` (see `CollectionJob.job_id`) rather than reading `status().job`,
+   * which under concurrency can be a sibling.
+   *
+   * Presence: an `ingest` 202 always carries one (against a service new enough to send it).
+   * An `ask` 202 carries the id of whichever job will answer it, WHEN the service can name
+   * one — the job the ask created, a job it joined that an earlier identical ask started, or
+   * (for a sources-less ask, or one whose own job is already terminal) the collection's
+   * display job. So a present `job_id` does NOT by itself mean "this ask created the job":
+   * always match it, never assume it is yours. Absent only against a service too old to name
+   * jobs on an ask 202.
    */
   job_id?: string;
   /**
@@ -280,10 +294,10 @@ export interface CollectionJob extends IngestFailureDetail {
   pages_total: number;
   state: "running" | "complete" | "failed";
   /**
-   * WHICH job this block describes. Optional in three distinct ways, all of which a
-   * caller has to tolerate: an older deployment predates per-job rows and sends it
-   * nowhere; a row carried over from before those rows existed genuinely has no id; and
-   * only a call that CREATES a job is handed one back (see `AskPending.job_id`).
+   * WHICH job this status row describes. Optional in two ways a caller must tolerate: an
+   * older deployment predates per-job rows and sends it nowhere, and a row carried over from
+   * before those rows existed genuinely has no id. (Whether a CALLER is handed an id on a 202
+   * is a separate question about a different field — see `AskPending.job_id`.)
    *
    * Match it against the `job_id` from your own 202 rather than assuming `job` is yours:
    * a collection can have several ingests in flight at once, and `job` is whichever one
