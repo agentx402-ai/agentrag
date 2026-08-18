@@ -163,13 +163,16 @@ export function parseFlags(
       } else {
         flags[camel(key)] = val;
       }
-    } else if (/^-[A-Za-z]/.test(a)) {
-      // A SINGLE-dash, letter-leading token is a flag typo (`-collection`, `-max-spend-usd`),
-      // not a positional. Left as a positional it would defeat the fail-closed unknown-flag
-      // guard above: `-max-spend-usd 5` would silently become two positionals and leave the
-      // cap unset on real funds. Flags use two dashes. (A positional that must literally
-      // begin with `-` is not supported — quote a leading `--` away another way.)
-      throw new UsageError(`unknown flag ${a} (flags use two dashes, e.g. --${a.slice(1)})`);
+    } else if (a.startsWith("-") && !a.startsWith("--") && KNOWN_FLAGS.has(a.slice(1))) {
+      // A SINGLE-dash token that EXACTLY names a known flag is a typo (`-collection`,
+      // `-max-spend-usd`), not a positional. Left as a positional it would defeat the
+      // fail-closed unknown-flag guard above: `-max-spend-usd 5` would silently become two
+      // positionals and leave the cap unset on real funds. Only a known-flag match is rejected,
+      // so a free-text query that merely begins with a dash (e.g. `ask "-ish suffix"`) still
+      // parses as a positional.
+      throw new UsageError(
+        `unknown flag ${a} (did you mean --${a.slice(1)}? flags use two dashes)`,
+      );
     } else {
       positionals.push(a);
     }

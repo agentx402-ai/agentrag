@@ -40,6 +40,21 @@ describe("totalPriceUsd", () => {
     expect(totalPriceUsd(usage({ price_usd: 0.008, breakdown: [] }))).toBe(0.008);
   });
 
+  it("stays FINITE on a malformed usage (never NaN, which would poison the spend ledger)", () => {
+    // A success body reaches here through an unchecked JSON cast, so a missing or non-numeric
+    // price_usd (or a bad breakdown leg) must coerce to 0, not propagate NaN into recordSpend.
+    expect(totalPriceUsd(usage({ price_usd: undefined }))).toBe(0); // missing at runtime
+    // @ts-expect-error a non-numeric price_usd (e.g. a string) from a hostile/broken server
+    expect(totalPriceUsd(usage({ price_usd: "0.5" }))).toBe(0);
+    const withBadLeg = usage({
+      price_usd: 0.008,
+      // @ts-expect-error a breakdown leg missing its numeric price_usd
+      breakdown: [{ service: "rag", op: "ingest", list_price_usd: 0.01, credits_charged: 0 }],
+    });
+    expect(Number.isFinite(totalPriceUsd(withBadLeg))).toBe(true);
+    expect(totalPriceUsd(withBadLeg)).toBe(0.008);
+  });
+
   it("with an ingest leg -> top-level + the sum of the breakdown", () => {
     const u = usage({
       price_usd: 0.008,

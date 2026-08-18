@@ -24,12 +24,15 @@ describe("parseFlags", () => {
     expect(() => parseFlags(["--bogus"])).toThrow(/unknown flag --bogus/);
   });
 
-  it("rejects a SINGLE-dash flag typo instead of silently making it a positional", () => {
+  it("rejects a SINGLE-dash flag typo, but not a dash-leading positional query", () => {
     // `-max-spend-usd 5` (one dash) must NOT slip through as two positionals — that would
     // leave the spend cap unset on real funds while looking like it was set.
     expect(() => parseFlags(["-max-spend-usd", "5"])).toThrow(UsageError);
     expect(() => parseFlags(["-collection"])).toThrow(/flags use two dashes/);
-    // A lone "-" and non-flag positionals are still fine.
+    // Only a token that EXACTLY names a known flag is rejected — a free-text query that merely
+    // begins with a dash still parses as a positional (no over-eager block on `ask "-ish …"`).
+    expect(parseFlags(["-ish suffix usage"]).positionals).toEqual(["-ish suffix usage"]);
+    expect(parseFlags(["-notaknownflag"]).positionals).toEqual(["-notaknownflag"]);
     expect(parseFlags(["ask", "what is x"]).positionals).toEqual(["ask", "what is x"]);
   });
 

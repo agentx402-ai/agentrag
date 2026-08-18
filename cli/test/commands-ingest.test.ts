@@ -45,6 +45,18 @@ describe("ingest command", () => {
     expect(JSON.parse(out.join("")).status).toBe("complete");
   });
 
+  it("rejects a stray positional (a dropped --collection) instead of ingesting into a derived one", async () => {
+    // `agentrag ingest mycollection --sources …` almost always means `--collection mycollection`;
+    // ingesting into a name derived from the sources instead is a silent, money-spending surprise.
+    out = [];
+    err = [];
+    const client = fakeClient();
+    const code = await runIngest(["mycollection", "--sources", "https://ex.com/**"], io(client));
+    expect(code).toBe(2); // EXIT.USAGE
+    expect(err.join("")).toMatch(/ingest takes no positional arguments/);
+    expect(client.ingest).not.toHaveBeenCalled();
+  });
+
   it("passes collection/model/maxPages/refresh through", async () => {
     out = [];
     err = [];

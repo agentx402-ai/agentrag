@@ -595,9 +595,9 @@ describe("ingestAndWait", () => {
           { status: 200 },
         );
       }
-      // second poll (pollIngestJobState observes terminal) AND the one additional status()
-      // read afterwards both see the same terminal snapshot — carries the failure detail
-      // ingestAndWait must surface (pages_ok/pages_failed/failures/refunded_credits).
+      // second poll observes terminal — its snapshot is reused directly for the assembly (no
+      // extra status() read) and carries the failure detail ingestAndWait must surface
+      // (pages_ok/pages_failed/failures/refunded_credits).
       return new Response(
         JSON.stringify(
           statusEnvelope({
@@ -629,7 +629,7 @@ describe("ingestAndWait", () => {
       maxWaitMs: 5_000,
     });
 
-    expect(step).toBe(4); // POST ingest -> GET poll(running) -> GET poll(terminal) -> GET status
+    expect(step).toBe(3); // POST ingest -> GET poll(running) -> GET poll(terminal, reused for assembly)
     expect(result).toMatchObject({
       collection: "c9",
       status: "failed",
@@ -652,7 +652,7 @@ describe("ingestAndWait", () => {
       (c) => c.method === "POST" && c.url === `${endpoint}/v1/rag/ingest`,
     );
     expect(ingestPosts).toHaveLength(1);
-    expect(calls.map((c) => c.method)).toEqual(["POST", "GET", "GET", "GET"]);
+    expect(calls.map((c) => c.method)).toEqual(["POST", "GET", "GET"]);
   });
 
   it("throws ingest_timeout once maxWaitMs elapses while the job keeps reporting 'running' — and still never re-ingests", async () => {
@@ -785,9 +785,10 @@ describe("ingestAndWait: pins the job its own 202 named", () => {
       maxWaitMs: 5_000,
     });
 
-    // Two polls (running, then terminal) plus the one terminal status() read. Reading the
-    // display job instead would have stopped after ONE poll, on the sibling's "complete".
-    expect(statusReads).toBe(3);
+    // Two polls (running, then terminal) — the terminal poll's own snapshot is reused for the
+    // assembly, so there is NO extra status() read. Reading the display job instead would have
+    // stopped after ONE poll, on the sibling's "complete".
+    expect(statusReads).toBe(2);
     expect(ingestPosts).toBe(1);
 
     // Every outcome field is the caller's own job's, not the sibling's — the assembly read
@@ -858,7 +859,7 @@ describe("ingestAndWait: pins the job its own 202 named", () => {
       maxWaitMs: 5_000,
     });
 
-    expect(statusReads).toBe(3); // running -> complete -> the terminal assembly read
+    expect(statusReads).toBe(2); // running -> complete (its snapshot is reused for assembly)
     expect(result).toMatchObject({
       collection: "c11",
       status: "complete",

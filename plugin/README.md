@@ -41,9 +41,10 @@ cd agentrag && npm ci && npm run build
 ```
 
 `--plugin-dir` loads `plugin/agentrag/.mcp.json` as checked in, and that file runs
-`npx -y @agentrag/cli@0.1.6 mcp` — a version-pinned registry spec that fetches the published
-package rather than the local build you just made. To test a LOCAL build instead, point your
-**local, uncommitted** copy of `.mcp.json` at it — edit `command`/`args` only, leave `env` as-is:
+`npx -y @agentrag/cli@<pinned> mcp` — a version-pinned registry spec (the exact version lives in
+`.mcp.json`, kept in lockstep by the release process) that fetches the published package rather
+than the local build you just made. To test a LOCAL build instead, point your **local,
+uncommitted** copy of `.mcp.json` at it — edit `command`/`args` only, leave `env` as-is:
 
 ```json
 {

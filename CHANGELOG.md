@@ -23,10 +23,19 @@ All notable changes to this project are documented here. Format: [Keep a Changel
   `job_id` as "no id" (display-job fallback), and no longer adopts an unrelated sibling from a
   present-but-empty `jobs[]`.
 - **CLI rejects dropped positionals and single-dash flag typos.** `agentrag ask what is x`
-  (unquoted) and `agentrag delete a b c` used to silently act on only the first word/name; a
-  `-collection`-style single-dash typo used to become a positional, defeating the fail-closed
-  unknown-flag guard. All are now usage errors. `agentrag mcp` rejects trailing flags rather
-  than silently dropping money-relevant ones (e.g. `--max-spend-usd`).
+  (unquoted), `agentrag delete a b c`, and a stray `agentrag ingest mycollection` used to
+  silently act on only the first token / a derived collection; a single-dash token that names
+  a flag (`-collection`, `-max-spend-usd`) used to become a positional, defeating the
+  fail-closed unknown-flag guard (a free-text query that merely begins with a dash still
+  parses). All are now usage errors. `agentrag mcp` rejects trailing flags rather than
+  silently dropping money-relevant ones (e.g. `--max-spend-usd`).
+- **`totalPriceUsd` can no longer return `NaN`** from a malformed success body — a
+  missing/non-numeric `price_usd` coerces to 0 instead of poisoning the account-mode spend
+  ledger (which would refuse all further spend, since `NaN <= cap` is always false).
+- **`ingestAndWait` no longer makes a redundant terminal `status()` round trip.** The poll now
+  returns the parsed status alongside the pinned job, so the terminal iteration's own snapshot
+  is reused for the result assembly — one fewer request, and the assembled `status`/counters
+  can no longer disagree with what the poll observed (two separate reads previously could).
 - **`config.json` fails closed on a `privateKey`/`accountKey` field** instead of silently
   ignoring it (secrets are env-only) — it was both inert and a plaintext key on disk.
 - `ask()` now validates `collection` pre-request like every other collection verb;
@@ -46,6 +55,13 @@ All notable changes to this project are documented here. Format: [Keep a Changel
   pinned to a follow-up `status()` poll, matching `AskPending` and `CollectionJob`.
 - **`extend(collection, days, { idempotencyKey })`** — optional idempotency key for safe retries.
 - **`MIN_SERVER_POLL_INTERVAL_MS`** export — the floor applied to a server-supplied `retry_after`.
+
+### Deprecated
+
+- **`AgentRag`'s `protected pollIngestJobState`** — superseded by `protected pollIngestJob`,
+  which returns the parsed `status` alongside the pinned job. The wait methods now route through
+  `pollIngestJob`, so a subclass that overrode the older one-arg helper can no longer silently
+  unpin them. `pollIngestJobState` remains as a thin delegate for backward compatibility.
 
 ## [0.1.6] — 2026-08-12
 
