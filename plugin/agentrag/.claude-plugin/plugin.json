@@ -1,6 +1,6 @@
 {
   "name": "agentrag",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "AgentRAG: x402-paid retrieval-augmented generation for agents. Ingest your own documents or URLs into a collection (hybrid BM25 + vector search), then ask grounded questions against them — paid per call in USDC, no accounts or API keys.",
   "license": "MIT",
   "author": {

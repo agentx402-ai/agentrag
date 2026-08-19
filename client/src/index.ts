@@ -54,7 +54,7 @@ export * from "./usage";
 
 // Compiled into the published bundle and reported to the service; kept in lockstep with
 // package.json's version by the `versions` CI job (version-lockstep source 3 of 6).
-export const VERSION = "0.1.6";
+export const VERSION = "0.1.7";
 
 /** Fixed at collection creation — an `ingest` against an existing collection with a
  * different model is rejected server-side (model_mismatch). */
