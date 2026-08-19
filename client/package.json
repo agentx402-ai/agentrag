@@ -42,7 +42,7 @@
   },
   "dependencies": {
     "@agentx402-ai/core": "^0.4.0",
-    "viem": "^2.55.10"
+    "viem": "^2.55.16"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
