@@ -68,9 +68,15 @@ Client code here authorizes real USDC payments. Four invariants are load-bearing
    that same ceiling from its OWN pinned prices (`ASK_BASE_USD`, `INGEST_PAGE_USD`, …)
    BEFORE any request, and refuses a challenge that quotes more than that ceiling —
    the server's price is never trusted past an independently computed bound.
-4. **The SDK signs the challenge's exact amount.** The server's `402`-quoted price is
-   signed verbatim (`buildPaymentHeader` pins the network, the canonical USDC token, and
-   `expectedPayTo`); the SDK never signs a self-computed sum.
+4. **The SDK signs an amount it has bounded — never one the server can inflate.** For
+   `ask`/`ingest` the server's `402`-quoted price is signed verbatim, after the invariant-3
+   ceiling check. `extend` is the ONE deliberate exception: its pre-auth `402` is a stateless
+   placeholder quote (reading the real chunk count pre-auth would make `extend` a
+   collection-size oracle for an unauthenticated caller), so the SDK signs a SELF-COMPUTED
+   amount — the real per-block price from the collection's own chunk count — bounded above by
+   an INDEPENDENT structural ceiling (`maxExtendAmountUsd`, derived from `MAX_CHUNKS`, never
+   from the server-supplied chunk count; see `pricing.ts`). In every case `buildPaymentHeader`
+   pins the network, the canonical USDC token, and `expectedPayTo`.
 
 **AgentRAG v1 pays no publisher tolls.** There is no `maxTollUsd` option and no
 toll-related error codes (spec §11.2) — every payment here is between the caller and

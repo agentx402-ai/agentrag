@@ -1,4 +1,4 @@
-import { EXTEND_FLAGS, parseFlags } from "../args";
+import { EXTEND_FLAGS, extraPositionalError, parseFlags } from "../args";
 import { EXIT, printError, printJson, type Writer } from "../output";
 
 // Exported so tests can type a fake client against the exact shape the real AgentRag must
@@ -27,6 +27,8 @@ export function parseExtendArgs(args: string[]): ExtendArgs {
   const { flags, positionals } = parseFlags(args, EXTEND_FLAGS);
   const collection = positionals[0];
   if (!collection) return { ok: false, message: "extend requires <collection>" };
+  const extra = extraPositionalError(positionals, "extend", "collection");
+  if (extra) return { ok: false, message: extra };
   const f = flags as { days?: number };
   if (f.days === undefined) return { ok: false, message: "extend requires --days 30|60|90" };
   if (!isExtendDays(f.days)) {

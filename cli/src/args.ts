@@ -93,6 +93,26 @@ function camel(k: string): string {
 }
 
 /**
+ * ask / delete / extend / status each take EXACTLY ONE positional. Silently using only
+ * `positionals[0]` and dropping the rest is a money/data trap: an unquoted multi-word query
+ * — `agentrag ask what is x` — arrives as three positionals and the command would pay for the
+ * ask "what"; `agentrag delete a b c` would delete only "a". Returns a usage message when
+ * there is more than one positional, else undefined.
+ */
+export function extraPositionalError(
+  positionals: string[],
+  command: string,
+  name: string,
+): string | undefined {
+  if (positionals.length > 1) {
+    return `${command} takes a single <${name}> but got ${positionals.length} (${JSON.stringify(
+      positionals,
+    )}) — quote it if it contains spaces`;
+  }
+  return undefined;
+}
+
+/**
  * @param allowed When given, restricts accepted flags to exactly this set (see the
  *   per-command *_FLAGS constants above) — a flag outside it is a usage error even when it's
  *   globally known, so a command can no longer silently accept and drop another command's flag.
@@ -143,6 +163,16 @@ export function parseFlags(
       } else {
         flags[camel(key)] = val;
       }
+    } else if (a.startsWith("-") && !a.startsWith("--") && KNOWN_FLAGS.has(a.slice(1))) {
+      // A SINGLE-dash token that EXACTLY names a known flag is a typo (`-collection`,
+      // `-max-spend-usd`), not a positional. Left as a positional it would defeat the
+      // fail-closed unknown-flag guard above: `-max-spend-usd 5` would silently become two
+      // positionals and leave the cap unset on real funds. Only a known-flag match is rejected,
+      // so a free-text query that merely begins with a dash (e.g. `ask "-ish suffix"`) still
+      // parses as a positional.
+      throw new UsageError(
+        `unknown flag ${a} (did you mean --${a.slice(1)}? flags use two dashes)`,
+      );
     } else {
       positionals.push(a);
     }

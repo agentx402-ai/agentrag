@@ -117,11 +117,11 @@ AgentRAG pays no publisher tolls — there is no toll flag or toll error path in
 
 ## MCP server / Claude plugin
 
-`agentrag mcp` exposes the service as MCP tools — `rag_ask`, `rag_ingest`, and `rag_extend`
+`agentrag mcp` exposes the service as six MCP tools — `rag_ask`, `rag_ingest`, and `rag_extend`
 (the three paid verbs), plus the free `rag_status` (check a collection's ingest progress and
-lifetime) and `rag_delete` (purge a collection) — for Claude Desktop / Code / Cursor. The paid
-tools are annotated as state-changing (never `readOnlyHint`) so a client knows to prompt a human
-before spending.
+lifetime), `rag_delete` (purge a collection), and `rag_wallet_address` (the address to fund) —
+for Claude Desktop / Code / Cursor. The paid tools are annotated as state-changing (never
+`readOnlyHint`) so a client knows to prompt a human before spending.
 
 The [`plugin/`](./plugin) directory packages this as an installable **Claude Code plugin**. In
 Claude Code:
@@ -139,9 +139,11 @@ verify with `/mcp`. Full steps: [`plugin/README.md`](./plugin/README.md).
 
 - **Pay per call over x402.** Each paid verb (`ask`, `ingest`, `extend`) is priced by the
   server's `402` challenge and settled in USDC on Base via x402 (EIP-3009
-  `transferWithAuthorization`). The SDK signs the challenge's **exact quoted amount** — never a
-  self-computed sum — pinning the network, the canonical USDC token, and (when you set
-  `expectedPayTo`) the recipient before signing.
+  `transferWithAuthorization`). For `ask`/`ingest` the SDK signs the challenge's **exact quoted
+  amount** after checking it against a ceiling it computed itself; `extend` signs a self-computed
+  price (its `402` is a deliberately stateless quote) bounded by an independent structural ceiling.
+  Either way the SDK pins the network, the canonical USDC token, and (when you set `expectedPayTo`)
+  the recipient before signing.
 - **The authorized ceiling follows the request shape.** An `ask` with `sources` can trigger an
   implicit ingest, so the server may legitimately quote more than the flat ask price. Before
   signing anything, the client computes its own ceiling from its pinned prices and refuses any

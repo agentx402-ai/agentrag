@@ -1,4 +1,4 @@
-import { parseFlags, STATUS_FLAGS } from "../args";
+import { extraPositionalError, parseFlags, STATUS_FLAGS } from "../args";
 import { EXIT, printError, printJson, type Writer } from "../output";
 
 // Exported so tests can type a fake client against the exact shape the real AgentRag must
@@ -19,6 +19,8 @@ export function parseStatusArgs(args: string[]): StatusArgs {
   const { positionals } = parseFlags(args, STATUS_FLAGS);
   const collection = positionals[0];
   if (!collection) return { ok: false, message: "status requires <collection>" };
+  const extra = extraPositionalError(positionals, "status", "collection");
+  if (extra) return { ok: false, message: extra };
   return { ok: true, collection };
 }
 

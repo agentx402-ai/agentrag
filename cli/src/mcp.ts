@@ -169,11 +169,15 @@ export function buildMcpServer(deps: { client: McpClient; wallet: WalletIdentity
           "Block until the ingest job finishes and return the final result, instead of a pending status",
         ),
     },
-    // Paid, and non-destructive for the same reason as rag_ask — see the note there.
+    // Paid. Marked DESTRUCTIVE because `refresh: true` re-fetches and re-indexes sources that
+    // already exist, overwriting their prior indexed content — a non-additive update, unlike
+    // rag_ask's purely additive on-demand ingest. The MCP annotation is static per-tool and
+    // cannot vary by argument, so it takes the conservative value: an MCP client prompts a
+    // human before a call that a refresh could use to replace indexed data.
     {
       title: "Ingest",
       readOnlyHint: false,
-      destructiveHint: false,
+      destructiveHint: true,
       openWorldHint: true,
     },
     async (a) => {

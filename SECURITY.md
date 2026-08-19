@@ -30,9 +30,14 @@ The SDK signs **real USDC payment authorizations** (EIP-3009 `transferWithAuthor
 for each call over x402. The guardrails against overspend are client-side, and they are what a
 review must scrutinize hardest:
 
-- **The SDK signs the server's exact quoted amount**, taken verbatim from the `402` challenge —
-  never a self-computed sum. `buildPaymentHeader` pins the expected network and the canonical USDC
-  token before signing, so a challenge that names a different chain or token is rejected.
+- **The SDK signs an amount it has bounded, never one the server can inflate.** For `ask`/`ingest`
+  the server's exact quoted amount is signed verbatim from the `402` challenge, after the authorized
+  ceiling check. `extend` is the one deliberate exception: its pre-auth `402` is a stateless
+  placeholder quote (so it can't be used as a collection-size oracle), so the SDK signs a
+  self-computed amount — the real per-block price — bounded above by an independent structural
+  ceiling (`maxExtendAmountUsd`, from `MAX_CHUNKS`, not the server's chunk count). In all cases
+  `buildPaymentHeader` pins the expected network and the canonical USDC token before signing, so a
+  challenge that names a different chain or token is rejected.
 - **Spend caps refuse, never silently cap.** `maxSpendUsd` / `AGENTRAG_MAX_SPEND_USD` (per call)
   and `maxSessionSpendUsd` / `AGENTRAG_MAX_SESSION_SPEND_USD` (cumulative) are checked BEFORE the
   challenge is signed; an over-cap op throws and signs nothing. A malformed cap value fails closed
@@ -65,12 +70,13 @@ keep it (and the wallet key `AGENTRAG_PRIVATE_KEY`) in env or a secret manager, 
 file or source control.
 
 **Secrets are read from env / the local keystore only** — never from CLI flags or the config
-file. The MCP server **scrubs the wallet and account keys from its own environment at startup**
-(once the client has captured them), so an agent-controlled child process cannot read them back;
-the secret-source guards also **refuse to read protected key material** (`AGENTRAG_PRIVATE_KEY` /
-`AGENTRAG_ACCOUNT_KEY`, or any `AGENTRAG_*` var whose name looks like key material), the
-keystore directory, and pseudo-filesystem paths (`/proc`, `/sys`). Keystore files are written
-`0600` in a `0700` directory.
+file (a `privateKey`/`accountKey` field placed in `config.json` is rejected outright, not
+silently ignored). The MCP server **scrubs the wallet and account keys from its own process
+environment at startup** (once the client has captured them — see `cli/src/secrets.ts`:
+`AGENTRAG_PRIVATE_KEY` / `AGENTRAG_ACCOUNT_KEY` and any `AGENTRAG_*` var whose name looks like key
+material), so a tool that dumps the server's own env, or a child process it later spawns, cannot
+read them back. This is best-effort in-process hygiene, not a sandbox — it does not reach a parent
+launcher's environment. Keystore files are written `0600` in a `0700` directory.
 
 ## Known advisories
 

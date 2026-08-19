@@ -36,6 +36,15 @@ import type { AskResult } from "./types";
  */
 export function totalPriceUsd(usage: AskResult["usage"]): number {
   if (usage === undefined) return 0;
-  const breakdownTotal = (usage.breakdown ?? []).reduce((sum, leg) => sum + leg.price_usd, 0);
-  return usage.price_usd + breakdownTotal;
+  // Coerce a non-finite leg to 0 rather than propagate NaN. `price_usd` is typed `number`,
+  // but a success body reaches here through an unchecked `JSON.parse(...) as` cast, so a
+  // malformed or hostile response could carry a missing/non-numeric price. Returning NaN
+  // would poison the account-mode SpendLedger via `recordSpend`, bricking all further spend
+  // (`NaN <= cap` is always false); the pre-request ceiling already bounded the op.
+  const finite = (n: unknown): number => (typeof n === "number" && Number.isFinite(n) ? n : 0);
+  const breakdownTotal = (usage.breakdown ?? []).reduce(
+    (sum, leg) => sum + finite(leg?.price_usd),
+    0,
+  );
+  return finite(usage.price_usd) + breakdownTotal;
 }

@@ -69,6 +69,20 @@ export async function runCli(
   // stack trace instead of the reason.
   try {
     if (cmd === "mcp") {
+      // `agentrag mcp` takes NO arguments: its whole configuration — endpoint, spend caps,
+      // secrets — comes from the environment (AGENTRAG_ENDPOINT, AGENTRAG_MAX_SPEND_USD,
+      // AGENTRAG_MAX_SESSION_SPEND_USD, AGENTRAG_PRIVATE_KEY/AGENTRAG_ACCOUNT_KEY), read by
+      // startMcp itself. A prior version silently dropped trailing args, so
+      // `agentrag mcp --max-spend-usd 5` looked like it set a cap but left it unset. Reject
+      // them fail-closed rather than drop a money-relevant flag.
+      if (rest.length > 0) {
+        return usageFail(
+          stderr,
+          `mcp takes no arguments (got ${JSON.stringify(rest)}) — configure the MCP server ` +
+            "via env: AGENTRAG_ENDPOINT, AGENTRAG_MAX_SPEND_USD, AGENTRAG_MAX_SESSION_SPEND_USD, " +
+            "AGENTRAG_PRIVATE_KEY | AGENTRAG_ACCOUNT_KEY",
+        );
+      }
       const { startMcp } = await import("./mcp.js");
       // `await`, not a bare return: returning the promise would hand the rejection back to the
       // caller UNCAUGHT, which is precisely the bug this try/catch exists to close.

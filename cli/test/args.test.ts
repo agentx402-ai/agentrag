@@ -3,6 +3,7 @@ import {
   ASK_FLAGS,
   DELETE_FLAGS,
   EXTEND_FLAGS,
+  extraPositionalError,
   GLOBAL_FLAGS,
   INGEST_FLAGS,
   parseFlags,
@@ -21,6 +22,18 @@ describe("parseFlags", () => {
   it("rejects an unknown flag (fail-closed) with a UsageError", () => {
     expect(() => parseFlags(["--max-spend-us", "5"])).toThrow(UsageError);
     expect(() => parseFlags(["--bogus"])).toThrow(/unknown flag --bogus/);
+  });
+
+  it("rejects a SINGLE-dash flag typo, but not a dash-leading positional query", () => {
+    // `-max-spend-usd 5` (one dash) must NOT slip through as two positionals — that would
+    // leave the spend cap unset on real funds while looking like it was set.
+    expect(() => parseFlags(["-max-spend-usd", "5"])).toThrow(UsageError);
+    expect(() => parseFlags(["-collection"])).toThrow(/flags use two dashes/);
+    // Only a token that EXACTLY names a known flag is rejected — a free-text query that merely
+    // begins with a dash still parses as a positional (no over-eager block on `ask "-ish …"`).
+    expect(parseFlags(["-ish suffix usage"]).positionals).toEqual(["-ish suffix usage"]);
+    expect(parseFlags(["-notaknownflag"]).positionals).toEqual(["-notaknownflag"]);
+    expect(parseFlags(["ask", "what is x"]).positionals).toEqual(["ask", "what is x"]);
   });
 
   it("boolean flags take no value and become true", () => {
@@ -163,5 +176,20 @@ describe("per-command flag allowlists", () => {
 
   it("WALLET_FLAGS accepts nothing, not even the global config flags (wallet never calls resolveConfig)", () => {
     expect(WALLET_FLAGS.size).toBe(0);
+  });
+});
+
+describe("extraPositionalError", () => {
+  it("returns undefined for zero or one positional", () => {
+    expect(extraPositionalError([], "ask", "query")).toBeUndefined();
+    expect(extraPositionalError(["what is x"], "ask", "query")).toBeUndefined();
+  });
+
+  it("returns a usage message naming the count when there is more than one positional", () => {
+    // The classic trap: an unquoted multi-word query arrives as multiple positionals.
+    const msg = extraPositionalError(["what", "is", "x"], "ask", "query");
+    expect(msg).toMatch(/ask takes a single <query>/);
+    expect(msg).toMatch(/got 3/);
+    expect(msg).toMatch(/quote it/);
   });
 });

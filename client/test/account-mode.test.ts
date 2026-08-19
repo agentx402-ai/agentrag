@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { AgentRag, ASK_BASE_USD } from "../src/index";
+import { AgentRag, ASK_BASE_USD, SpendCapError } from "../src/index";
 
 // Account-key mode: an opaque `ak_…` bearer is the identity and each call debits prepaid
 // credits. The request path is a SINGLE bearer-authenticated call — never the wallet-mode
@@ -83,5 +83,56 @@ describe("account-key mode request path", () => {
     // Exactly one request; it carried the bearer and never a signature (fund out-of-band).
     expect(calls.length).toBe(1);
     expect(new Headers(calls[0].init.headers).get("PAYMENT-SIGNATURE")).toBeNull();
+  });
+});
+
+// AGENTS.md money-safety invariant 1: "spend caps bound EVERY paying path." Account-key mode
+// pays from PREPAID CREDITS (real money), so maxSpendUsd / maxSessionSpendUsd must bind here
+// exactly as they do wallet mode. A prior version returned from the bearer branch before any
+// spend check, so both caps were dead in account-key mode — verified by driving the built
+// client (3x ingest at $1 each all settled under $0.000001 caps). These pin the fix.
+describe("account-key mode enforces spend caps (invariant 1)", () => {
+  const ask200 = () =>
+    new Response(
+      JSON.stringify({
+        data: { collection: "c1", matched: true, chunks: [] },
+        usage: { price_usd: ASK_BASE_USD },
+        request_id: "r-ask",
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
+
+  it("a per-call maxSpendUsd below the op's authorized ceiling throws SpendCapError, NO request issued", async () => {
+    let requests = 0;
+    const fetchImpl = (async () => {
+      requests++;
+      return ask200();
+    }) as unknown as typeof fetch;
+    const client = new AgentRag({
+      accountKey: AK,
+      endpoint,
+      fetchImpl,
+      maxSpendUsd: ASK_BASE_USD / 2, // below the ask's own authorized ceiling
+    });
+    await expect(client.ask("hi", { collection: "c1" })).rejects.toBeInstanceOf(SpendCapError);
+    expect(requests).toBe(0); // refused BEFORE the network, exactly like wallet mode
+  });
+
+  it("cumulative maxSessionSpendUsd bounds repeated account-key ops by ACTUAL settled usage", async () => {
+    let requests = 0;
+    const fetchImpl = (async () => {
+      requests++;
+      return ask200();
+    }) as unknown as typeof fetch;
+    // Budget for ~1.5 asks: the first settles ASK_BASE_USD, the second is refused before it spends.
+    const client = new AgentRag({
+      accountKey: AK,
+      endpoint,
+      fetchImpl,
+      maxSessionSpendUsd: ASK_BASE_USD * 1.5,
+    });
+    await client.ask("hi", { collection: "c1" }); // settles ASK_BASE_USD, recorded from usage
+    await expect(client.ask("hi", { collection: "c1" })).rejects.toBeInstanceOf(SpendCapError);
+    expect(requests).toBe(1); // only the first op reached the network
   });
 });

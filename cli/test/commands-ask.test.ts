@@ -54,6 +54,19 @@ describe("ask command", () => {
     expect(printed.query).toBe("what is x?");
   });
 
+  it("rejects an unquoted multi-word query instead of paying for the wrong (first) word", async () => {
+    // `agentrag ask what is x` arrives as three positionals; the pre-fix CLI paid for the ask
+    // "what". Reject it with a usage error and never touch the (spending) client.
+    out = [];
+    err = [];
+    const client = fakeClient();
+    const code = await runAsk(["what", "is", "x"], io(client));
+    expect(code).toBe(2); // EXIT.USAGE
+    expect(err.join("")).toMatch(/ask takes a single <query>/);
+    expect(client.ask).not.toHaveBeenCalled();
+    expect(client.askAndWait).not.toHaveBeenCalled();
+  });
+
   it("passes sources/collection/topK/mode/maxPages through to ask()", async () => {
     out = [];
     err = [];

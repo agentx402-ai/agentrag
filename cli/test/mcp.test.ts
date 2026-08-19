@@ -124,8 +124,9 @@ describe("agentrag mcp tools", () => {
 
   // The full annotation set, pinned. These are the hints a host uses to decide whether to prompt
   // a human, so an untruthful one is a real bug: `destructiveHint` DEFAULTS TO TRUE per the MCP
-  // spec, so every paid tool must set it explicitly to `false` — EXCEPT rag_delete, which is
-  // free but genuinely destructive and correctly carries `destructiveHint: true`.
+  // spec, so a tool that is NOT destructive must set it explicitly to `false` (rag_ask,
+  // rag_extend). rag_delete (free, deletes a collection) and rag_ingest (can overwrite indexed
+  // content via refresh) both genuinely carry `destructiveHint: true`.
   it("every tool advertises exactly the intended annotations", () => {
     const t = tools(fakeClient());
     expect(t.rag_ask.annotations).toEqual({
@@ -137,7 +138,10 @@ describe("agentrag mcp tools", () => {
     expect(t.rag_ingest.annotations).toEqual({
       title: "Ingest",
       readOnlyHint: false,
-      destructiveHint: false,
+      // DESTRUCTIVE: `refresh: true` re-fetches and re-indexes sources that already exist,
+      // overwriting their prior indexed content — a non-additive update. The static hint takes
+      // the conservative value so a host prompts a human before a refresh can replace data.
+      destructiveHint: true,
       openWorldHint: true,
     });
     expect(t.rag_extend.annotations).toEqual({
@@ -164,14 +168,17 @@ describe("agentrag mcp tools", () => {
     });
   });
 
-  it("every paid verb is never advertised as read-only, and explicitly never as destructive", () => {
+  it("every paid verb is never advertised as read-only; destructiveHint is truthful per tool", () => {
     const t = tools(fakeClient());
     for (const name of PAID) {
       expect(t[name].annotations?.readOnlyHint).toBe(false);
-      expect(t[name].annotations?.destructiveHint).toBe(false);
       // Omitted, not false: the MCP default (false) is already the truthful value.
       expect(t[name].annotations).not.toHaveProperty("idempotentHint");
     }
+    // rag_ask / rag_extend are purely additive; rag_ingest can overwrite via refresh.
+    expect(t.rag_ask.annotations?.destructiveHint).toBe(false);
+    expect(t.rag_extend.annotations?.destructiveHint).toBe(false);
+    expect(t.rag_ingest.annotations?.destructiveHint).toBe(true);
   });
 
   it("rag_delete is the one tool where destructiveHint:true is correct", () => {

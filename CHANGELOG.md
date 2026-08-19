@@ -2,6 +2,67 @@
 
 All notable changes to this project are documented here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project adheres to [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`askAndWait()` can no longer sign an unbounded number of payment authorizations.** The
+  re-ask loop is now pinned to a single idempotency key (hence a single EIP-3009 nonce) for
+  every re-ask iteration, even on the default no-`idempotencyKey` path — previously each
+  re-ask minted a fresh, separately-settleable nonce, so a server that kept returning `202`
+  could drive one call into many distinct signed authorizations. A server-supplied
+  `retry_after` is also floored (`MIN_SERVER_POLL_INTERVAL_MS`) so it cannot dictate a
+  zero-delay poll/re-ask loop; an explicit `pollIntervalMs` (including `0`) is unaffected.
+- **Spend caps now bind account-key (bearer) mode.** `maxSpendUsd` / `maxSessionSpendUsd`
+  were only enforced on the wallet path; the account-key path (prepaid credits — real money)
+  returned before any check. It now asserts the per-call cap against the op's authorized
+  ceiling before the request and records the cumulative spend from the response's usage.
+- **`ingestAndWait()` / `askAndWait()` no longer fabricate a `"failed"` verdict** for a
+  running, already-paid ingest whose retained job row has not caught up: `selectJob` now
+  falls back to the display job when it names your own `job_id`, treats a `null`/empty wire
+  `job_id` as "no id" (display-job fallback), and no longer adopts an unrelated sibling from a
+  present-but-empty `jobs[]`.
+- **CLI rejects dropped positionals and single-dash flag typos.** `agentrag ask what is x`
+  (unquoted), `agentrag delete a b c`, and a stray `agentrag ingest mycollection` used to
+  silently act on only the first token / a derived collection; a single-dash token that names
+  a flag (`-collection`, `-max-spend-usd`) used to become a positional, defeating the
+  fail-closed unknown-flag guard (a free-text query that merely begins with a dash still
+  parses). All are now usage errors. `agentrag mcp` rejects trailing flags rather than
+  silently dropping money-relevant ones (e.g. `--max-spend-usd`).
+- **`totalPriceUsd` can no longer return `NaN`** from a malformed success body — a
+  missing/non-numeric `price_usd` coerces to 0 instead of poisoning the account-mode spend
+  ledger (which would refuse all further spend, since `NaN <= cap` is always false).
+- **`ingestAndWait` no longer makes a redundant terminal `status()` round trip.** The poll now
+  returns the parsed status alongside the pinned job, so the terminal iteration's own snapshot
+  is reused for the result assembly — one fewer request, and the assembled `status`/counters
+  can no longer disagree with what the poll observed (two separate reads previously could).
+- **`config.json` fails closed on a `privateKey`/`accountKey` field** instead of silently
+  ignoring it (secrets are env-only) — it was both inert and a plaintext key on disk.
+- `ask()` now validates `collection` pre-request like every other collection verb;
+  `maxRetries` rejects `Infinity`/`NaN` at construction; `extend()` accepts an
+  `idempotencyKey` so a retried-but-settled extend dedups instead of double-charging.
+- **`rag_ingest`'s MCP `destructiveHint` is now `true`** — `refresh:true` overwrites indexed
+  content, a non-additive update, so a host should prompt before it.
+- Documentation corrections: the "SDK never signs a self-computed sum" invariant is scoped to
+  exclude `extend`'s deliberate self-computed (structurally-bounded) amount; SECURITY.md no
+  longer describes secret-source read-refusal guards that do not exist in this repo; the
+  `AskPending`/`CollectionJob` `job_id` presence rules match the deployed server; the plugin
+  README reflects that `@agentrag/cli` is published and pinned at `0.1.6`.
+
+### Added
+
+- **`job_id` on `IngestProgress`** — the inline `AskResult.ingest` progress surface can now be
+  pinned to a follow-up `status()` poll, matching `AskPending` and `CollectionJob`.
+- **`extend(collection, days, { idempotencyKey })`** — optional idempotency key for safe retries.
+- **`MIN_SERVER_POLL_INTERVAL_MS`** export — the floor applied to a server-supplied `retry_after`.
+
+### Deprecated
+
+- **`AgentRag`'s `protected pollIngestJobState`** — superseded by `protected pollIngestJob`,
+  which returns the parsed `status` alongside the pinned job. The wait methods now route through
+  `pollIngestJob`, so a subclass that overrode the older one-arg helper can no longer silently
+  unpin them. `pollIngestJobState` remains as a thin delegate for backward compatibility.
+
 ## [0.1.6] — 2026-08-12
 
 ### Fixed

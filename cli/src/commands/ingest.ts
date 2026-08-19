@@ -51,7 +51,19 @@ export type IngestArgs =
  * before a client is ever built.
  */
 export function parseIngestArgs(args: string[]): IngestArgs {
-  const { flags } = parseFlags(args, INGEST_FLAGS);
+  const { flags, positionals } = parseFlags(args, INGEST_FLAGS);
+  // ingest takes NO positional arguments — its inputs are all flags (--sources/--documents/
+  // --collection). A stray positional almost always means a dropped flag (e.g.
+  // `agentrag ingest mycollection` meaning `--collection mycollection`); reject it rather than
+  // silently ingest into a different, derived collection.
+  if (positionals.length > 0) {
+    return {
+      ok: false,
+      message: `ingest takes no positional arguments (got ${JSON.stringify(
+        positionals,
+      )}) — pass inputs as flags: --sources / --documents / --collection`,
+    };
+  }
   const f = flags as {
     sources?: string[];
     documents?: string;

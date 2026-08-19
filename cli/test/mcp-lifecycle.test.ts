@@ -112,14 +112,15 @@ describe("MCP server lifecycle", () => {
       ]);
 
       // 1b. The annotations a HOST actually sees over the wire (not just the in-process
-      // registry): a paid verb must never advertise itself as read-only, nor as possibly
-      // destructive. destructiveHint defaults to TRUE when omitted, so it has to be present
-      // and false; rag_delete is the one deliberate exception (free but destructive).
+      // registry): a paid verb must never advertise itself as read-only. destructiveHint
+      // defaults to TRUE when omitted, so the additive verbs (rag_ask, rag_extend) set it
+      // explicitly false; rag_ingest (overwrites via refresh) and rag_delete are destructive.
       for (const name of ["rag_ask", "rag_ingest", "rag_extend"]) {
-        const paid = tools.find((t) => t.name === name);
-        expect(paid?.annotations?.readOnlyHint).toBe(false);
-        expect(paid?.annotations?.destructiveHint).toBe(false);
+        expect(tools.find((t) => t.name === name)?.annotations?.readOnlyHint).toBe(false);
       }
+      expect(tools.find((t) => t.name === "rag_ask")?.annotations?.destructiveHint).toBe(false);
+      expect(tools.find((t) => t.name === "rag_extend")?.annotations?.destructiveHint).toBe(false);
+      expect(tools.find((t) => t.name === "rag_ingest")?.annotations?.destructiveHint).toBe(true);
       expect(tools.find((t) => t.name === "rag_delete")?.annotations?.destructiveHint).toBe(true);
 
       // 2. The initialize handshake advertises the CLI VERSION.

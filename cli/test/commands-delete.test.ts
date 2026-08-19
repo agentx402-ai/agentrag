@@ -39,6 +39,17 @@ describe("delete command", () => {
     expect(JSON.parse(out.join("")).deleted).toBe(true);
   });
 
+  it("rejects extra positionals instead of silently deleting only the first", async () => {
+    // `agentrag delete a b c` used to delete ONLY "a" and drop "b"/"c" silently.
+    out = [];
+    err = [];
+    const client = fakeClient();
+    const code = await runDelete(["a", "b", "c"], io(client));
+    expect(code).toBe(2); // EXIT.USAGE
+    expect(err.join("")).toMatch(/delete takes a single <collection>/);
+    expect(client.delete).not.toHaveBeenCalled();
+  });
+
   // Review Minor: "every command accepts every other command's flags and silently drops them."
   // delete takes no verb-specific flags at all — anything beyond the global config flags is
   // now a usage error. runDelete doesn't catch parseFlags's UsageError itself (only runCli's

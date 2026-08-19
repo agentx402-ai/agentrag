@@ -1,4 +1,4 @@
-import { DELETE_FLAGS, parseFlags } from "../args";
+import { DELETE_FLAGS, extraPositionalError, parseFlags } from "../args";
 import { EXIT, printError, printJson, type Writer } from "../output";
 
 // Exported so tests can type a fake client against the exact shape the real AgentRag must
@@ -19,6 +19,8 @@ export function parseDeleteArgs(args: string[]): DeleteArgs {
   const { positionals } = parseFlags(args, DELETE_FLAGS);
   const collection = positionals[0];
   if (!collection) return { ok: false, message: "delete requires <collection>" };
+  const extra = extraPositionalError(positionals, "delete", "collection");
+  if (extra) return { ok: false, message: extra };
   return { ok: true, collection };
 }
 

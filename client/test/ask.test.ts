@@ -1,6 +1,12 @@
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { describe, expect, it, vi } from "vitest";
-import { AgentRag, AgentRagError, DEFAULT_ASK_POLL_INTERVAL_MS, SpendCapError } from "../src/index";
+import {
+  AgentRag,
+  AgentRagError,
+  DEFAULT_ASK_POLL_INTERVAL_MS,
+  MIN_SERVER_POLL_INTERVAL_MS,
+  SpendCapError,
+} from "../src/index";
 import { askAuthorizedCeilingUsd } from "../src/pricing";
 
 // Every 200/202 fixture in this file mirrors the REAL wire envelope
@@ -95,6 +101,22 @@ describe("ask: client-side validation runs BEFORE any request", () => {
       fetchImpl: fetchImpl as unknown as typeof fetch,
     });
     await expect(client.ask("   ", { collection: "c1" })).rejects.toMatchObject({
+      code: "invalid_request",
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("an empty collection throws invalid_request with NO request issued (parity with ingest/extend/status)", async () => {
+    // ask() was the only paying verb that reached the network on an empty collection, burning
+    // a wallet-mode signature on a body the worker would 400. It now runs the same
+    // assertValidCollectionName guard every other collection-taking verb does, pre-request.
+    const fetchImpl = vi.fn();
+    const client = new AgentRag({
+      signer,
+      endpoint,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    await expect(client.ask("what is x", { collection: "" })).rejects.toMatchObject({
       code: "invalid_request",
     });
     expect(fetchImpl).not.toHaveBeenCalled();
@@ -590,9 +612,11 @@ describe("askAndWait", () => {
     // OTHER askAndWait test in this file passes an explicit pollIntervalMs (usually 0) to
     // skip waiting deterministically — this is the one test that drives the real production
     // default path: no pollIntervalMs override, and a genuine positive retry_after on the
-    // 202. retry_after: 0.001 -> a 1ms poll delay, proven via a setTimeout spy rather than
-    // merely a short test timeout, so a regression that used some OTHER hardcoded delay
-    // (not the 15s fallback, but also not the server's real value) would still be caught.
+    // 202. retry_after: 2 -> a 2000ms poll delay (above MIN_SERVER_POLL_INTERVAL_MS, so the
+    // server value passes through un-floored), proven via a setTimeout spy rather than merely
+    // a short test timeout, so a regression that used some OTHER hardcoded delay (not the 15s
+    // fallback, but also not the server's real value) would still be caught. The sub-floor
+    // clamp is covered by its own test below.
     let step = 0;
     const fetchImpl = (async () => {
       step++;
@@ -604,7 +628,7 @@ describe("askAndWait", () => {
               status: "ingesting",
               pages_done: 0,
               pages_total: 1,
-              retry_after: 0.001,
+              retry_after: 2,
             }),
           ),
           { status: 202 },
@@ -649,8 +673,73 @@ describe("askAndWait", () => {
 
     expect(result.matched).toBe(true);
     const delays = setTimeoutSpy.mock.calls.map((call) => call[1]);
-    expect(delays).toContain(1); // retry_after (0.001s) * 1000, actually used
+    expect(delays).toContain(2000); // retry_after (2s) * 1000, actually used (above the floor)
     expect(delays).not.toContain(DEFAULT_ASK_POLL_INTERVAL_MS); // the fallback, NOT used
+    setTimeoutSpy.mockRestore();
+  });
+
+  it("floors a sub-second server retry_after to MIN_SERVER_POLL_INTERVAL_MS", async () => {
+    // A hostile/buggy service returning retry_after: 0.001 must NOT be able to dictate a
+    // ~1ms poll+re-ask loop at network speed (an unbounded-work vector — the re-ask leg is
+    // paid). The server-supplied value is clamped to MIN_SERVER_POLL_INTERVAL_MS; an
+    // EXPLICIT pollIntervalMs (including 0) is a caller decision and is never floored.
+    let step = 0;
+    const fetchImpl = (async () => {
+      step++;
+      if (step === 1) {
+        return new Response(
+          JSON.stringify(
+            askEnvelope({
+              collection: "c1",
+              status: "ingesting",
+              pages_done: 0,
+              pages_total: 1,
+              retry_after: 0.001, // 1ms if honored verbatim — must be floored to 1000
+            }),
+          ),
+          { status: 202 },
+        );
+      }
+      if (step === 2) {
+        return new Response(
+          JSON.stringify(
+            statusEnvelope({
+              collection: "c1",
+              model: "@cf/baai/bge-m3",
+              pages: 1,
+              chunks: 4,
+              created_at: "2026-08-01T00:00:00.000Z",
+              expires_at: "2026-09-01T00:00:00.000Z",
+              job: { pages_done: 1, pages_total: 1, state: "complete" },
+            }),
+          ),
+          { status: 200 },
+        );
+      }
+      return new Response(
+        JSON.stringify(
+          askEnvelope({
+            collection: "c1",
+            expires_at: "2026-09-01T00:00:00.000Z",
+            matched: true,
+            chunks: [],
+          }),
+        ),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+    const client = new AgentRag({ accountKey: AK, endpoint, fetchImpl });
+    const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
+
+    await client.askAndWait("what is x", {
+      sources: ["https://a.com"],
+      maxWaitMs: 5_000,
+      // pollIntervalMs deliberately OMITTED — the server value governs, but floored.
+    });
+
+    const delays = setTimeoutSpy.mock.calls.map((call) => call[1]);
+    expect(delays).toContain(MIN_SERVER_POLL_INTERVAL_MS); // 1000, the floor
+    expect(delays).not.toContain(1); // the un-floored 1ms value must NEVER be used
     setTimeoutSpy.mockRestore();
   });
 
@@ -758,7 +847,7 @@ describe("askAndWait", () => {
     });
   });
 
-  it("I2: the re-ask still gets a fresh idempotency key when the caller supplied none", async () => {
+  it("I2: the default-path re-ask key is a STABLE derived nonce, distinct from the initial ask", async () => {
     const calls: Array<{ method: string; idempotencyKey: string | null }> = [];
     const client = new AgentRag({
       accountKey: AK,
@@ -770,17 +859,80 @@ describe("askAndWait", () => {
       sources: ["https://a.com"],
       pollIntervalMs: 0,
       maxWaitMs: 5_000,
+      // idempotencyKey deliberately OMITTED — the default path.
     });
 
     expect(calls).toHaveLength(4);
     const initialKey = calls[0]?.idempotencyKey;
     const reAskKey = calls[3]?.idempotencyKey;
     expect(initialKey).toBeTruthy();
-    expect(reAskKey).toBeTruthy();
-    // Both are fresh, independently-generated nonces — never a fixed "undefined:ask"
-    // string, and never the same value reused across the two logical operations.
+    // Money-safety: even with no caller key, the re-ask key is a single stable base with the
+    // `:ask` suffix — reused verbatim across EVERY re-ask iteration, so all re-ask legs sign
+    // one EIP-3009 nonce and at most one is settleable on-chain. A prior version generated a
+    // fresh un-suffixed nonce per iteration, minting an unbounded number of separately
+    // settleable authorizations. Distinct from the initial ask's key, whose amount differs.
+    expect(reAskKey).toMatch(/:ask$/);
     expect(reAskKey).not.toBe(initialKey);
-    expect(reAskKey).not.toContain(":ask");
+    expect(reAskKey).not.toBe("undefined:ask"); // never a fixed literal from a missing base
+  });
+
+  it("I2: every re-ask iteration reuses ONE nonce (no per-iteration mint) on the default path", async () => {
+    // The money-safety core of H1: drive multiple re-ask iterations (the job keeps flapping
+    // back to a fresh 202) and assert every paid re-ask carries the SAME Idempotency-Key, so
+    // nonceFromIdempotencyKey yields one nonce and only one authorization can ever settle.
+    const askKeys: string[] = [];
+    let step = 0;
+    const fetchImpl = (async (_input: unknown, init?: RequestInit) => {
+      const method = init?.method ?? "GET";
+      step++;
+      if (method === "POST") {
+        askKeys.push(new Headers(init?.headers).get("Idempotency-Key") ?? "");
+        // Always return a fresh 202 -> the loop must re-ask again next iteration.
+        return new Response(
+          JSON.stringify(
+            askEnvelope({
+              collection: "c1",
+              status: "ingesting",
+              pages_done: 0,
+              pages_total: 1,
+              retry_after: 0,
+            }),
+          ),
+          { status: 202 },
+        );
+      }
+      // status: report the job complete so the poll breaks and the loop re-asks.
+      return new Response(
+        JSON.stringify(
+          statusEnvelope({
+            collection: "c1",
+            model: "@cf/baai/bge-m3",
+            pages: 0,
+            chunks: 0,
+            created_at: "2026-08-01T00:00:00.000Z",
+            expires_at: "2026-09-01T00:00:00.000Z",
+            job: { pages_done: 1, pages_total: 1, state: "complete" },
+          }),
+        ),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+    const client = new AgentRag({ accountKey: AK, endpoint, fetchImpl });
+
+    await expect(
+      client.askAndWait("what is x", {
+        sources: ["https://a.com"],
+        pollIntervalMs: 0,
+        maxWaitMs: 60,
+      }),
+    ).rejects.toMatchObject({ code: "ingest_timeout" });
+
+    void step;
+    // The initial ask uses its own key; every subsequent re-ask shares one key.
+    const reAskKeys = askKeys.slice(1);
+    expect(reAskKeys.length).toBeGreaterThan(1); // the loop really did re-ask repeatedly
+    expect(new Set(reAskKeys).size).toBe(1); // ...all under a SINGLE idempotency key/nonce
+    expect(reAskKeys[0]).toMatch(/:ask$/);
   });
 
   it("throws ingest_timeout once maxWaitMs elapses while the job keeps reporting 'running'", async () => {
