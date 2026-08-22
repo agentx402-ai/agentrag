@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented here. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project adheres to [SemVer](https://semver.org/).
 
+## [0.1.8] — 2026-08-22
+
+### Changed
+
+- Adopt `@agentx402-ai/core` `^0.4.1`, which brings `@x402/core` + `@x402/evm` 2.23.0 (the
+  registry field rename `address` → `asset`, handled internally by core). No public API or
+  behavior change here — the payment path is unaffected. Also refreshes `viem` to 2.55.19 and
+  `@biomejs/biome` to 2.5.10.
+
 ## [0.1.7] — 2026-08-19
 
 ### Fixed
