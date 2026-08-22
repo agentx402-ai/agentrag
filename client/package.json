@@ -41,7 +41,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@agentx402-ai/core": "^0.4.0",
+    "@agentx402-ai/core": "^0.4.1",
     "viem": "^2.55.10"
   },
   "devDependencies": {
