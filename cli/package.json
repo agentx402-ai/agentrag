@@ -29,7 +29,7 @@
   },
   "dependencies": {
     "@agentrag/client": "^0.1.8",
-    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@modelcontextprotocol/sdk": "^1.30.1",
     "viem": "^2.55.10",
     "zod": "^3.25.76"
   },
